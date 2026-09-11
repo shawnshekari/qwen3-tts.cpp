@@ -315,6 +315,23 @@ GLSL version would still be ~10 dispatches per step.
   enables ICL cloning, which is a quality lever untested so far — and
   would re-roll the voice like everything else.
 
+- **Vocoder scratch grows with the longest utterance ever decoded and is
+  never released.** ggml's scheduler keeps its compute buffers at the
+  high-water mark; a one-shot decode costs ~4.7 MB of scratch per frame,
+  so one runaway 2048-frame request (seen on the live server 2026-09-10,
+  temp 0.9, random seed) left `tts-engine` holding 16.8 GB (4.8 VRAM +
+  12 GTT) until restart. Fixed by routing `decode()` through the
+  streaming decoder in 64-frame chunks (`decode_chunk_frames_`,
+  `QWEN3_TTS_DECODE_CHUNK=0` restores one-shot): a 496-frame request now
+  ends at 3.6 GB instead of 5.9, and the vocoder share no longer scales
+  with length. The service unit also carries `--max-tokens 600`.
+  Chunked vs one-shot is ~51 dB SNR on speech on the XTX, not bit-exact:
+  `tests/test_streaming_parity` already fails its 1e-4 tolerance here
+  with the untouched one-shot path (max 0.10 / rms 2.8e-3 on random
+  codes) because Vulkan's coopmat matmul output depends on batch size;
+  the bit-exact claim in `streaming_design.md` was established on Strix
+  Halo. Chunked `decode()` vs `stream_decode` at the same chunk is exact.
+
 ## Things already ruled out
 
 - **Bumping ggml to v0.23.0** (branch `ggml-bump`): vocoder 232 -> 141 ms,

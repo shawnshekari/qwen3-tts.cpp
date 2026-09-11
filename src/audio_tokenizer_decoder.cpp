@@ -993,7 +993,37 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         error_msg_ = "Model not loaded";
         return false;
     }
-    
+
+    int32_t chunk = decode_chunk_frames_;
+    if (const char * env = std::getenv("QWEN3_TTS_DECODE_CHUNK")) {
+        chunk = atoi(env);
+    }
+    if (chunk <= 0 || n_frames <= chunk) {
+        return decode_one_shot(codes, n_frames, samples);
+    }
+
+    // Equal-sized chunks so the last one is never a sliver (sub-16-frame
+    // chunks are where chunked and one-shot output diverge).
+    const int32_t n_chunks = (n_frames + chunk - 1) / chunk;
+    const int32_t per_chunk = (n_frames + n_chunks - 1) / n_chunks;
+    const int32_t n_cb = model_.config.n_codebooks;
+
+    stream_reset();
+    samples.clear();
+    for (int32_t f = 0; f < n_frames; f += per_chunk) {
+        const int32_t n = std::min(per_chunk, n_frames - f);
+        // stream_decode appends each chunk's PCM to samples
+        if (!stream_decode(codes + (size_t) f * n_cb, n, samples)) {
+            stream_reset();
+            return false;
+        }
+    }
+    stream_reset();
+    return true;
+}
+
+bool AudioTokenizerDecoder::decode_one_shot(const int32_t * codes, int32_t n_frames,
+                                             std::vector<float> & samples) {
     const auto & cfg = model_.config;
     
     codes_buf_.resize(n_frames * cfg.n_codebooks);

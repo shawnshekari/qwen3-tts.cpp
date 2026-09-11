@@ -178,6 +178,10 @@ public:
     // codes: audio codes [n_frames, n_codebooks] as int32_t (row-major)
     // n_frames: number of frames
     // Returns: audio samples normalized to [-1, 1] at 24kHz
+    // Utterances longer than decode_chunk_frames_ are run through the
+    // streaming decoder in equal chunks (bit-exact for chunks >= 16 frames,
+    // see docs/streaming_design.md) so the scheduler's scratch buffers stay
+    // bounded instead of growing with the longest utterance ever decoded.
     bool decode(const int32_t * codes, int32_t n_frames,
                 std::vector<float> & samples);
 
@@ -264,6 +268,14 @@ private:
     // Streaming mode flag consulted by build_graph to gate the KV-cache
     // and next_* output extensions.
     bool streaming_mode_ = false;
+
+    // decode() chunk size in frames; 0 = single graph over the whole
+    // utterance (QWEN3_TTS_DECODE_CHUNK overrides, for parity testing).
+    int32_t decode_chunk_frames_ = 64;
+
+    // Single-graph decode of the whole utterance.
+    bool decode_one_shot(const int32_t * codes, int32_t n_frames,
+                         std::vector<float> & samples);
 
     // Per-call streaming tail metadata, rebuilt by build_graph. next_node
     // points to the ggml_cont tensor that emits the last L frames and must
