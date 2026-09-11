@@ -167,6 +167,16 @@ bool load_tensor_data_from_file(
 ) {
     ggml_backend_t backend = ggml_backend_init_by_type(preferred_backend_type, nullptr);
     if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        // A caller asking for IGPU (or GPU) wants "the accelerator", not
+        // specifically an integrated one. On a discrete card IGPU init fails,
+        // and falling straight to CPU would strand the weights in host memory
+        // -- the scheduler then keeps the whole graph on CPU even though the
+        // compute backend is Vulkan. Try the other GPU type first.
+        enum ggml_backend_dev_type alt = preferred_backend_type == GGML_BACKEND_DEVICE_TYPE_IGPU
+            ? GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_IGPU;
+        backend = ggml_backend_init_by_type(alt, nullptr);
+    }
+    if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (!backend) {
