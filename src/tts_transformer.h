@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include "gguf.h"
 #include "coreml_code_predictor.h"
 
@@ -54,6 +55,8 @@ struct tts_timing {
 #endif
 
 #define QWEN3_TTS_MAX_NODES 16384
+// Upper bound for one persistent code-predictor graph (5 layers is ~250 tensors)
+#define QWEN3_TTS_CODE_PRED_MAX_NODES 1024
 
 // TTS Transformer configuration (Qwen2-based Talker)
 struct tts_transformer_config {
@@ -196,6 +199,21 @@ struct tts_kv_cache {
     int32_t n_layers = 28;
 };
 
+// One persistent code-predictor graph: built and allocated once, only its
+// per-frame inputs change afterwards. The step graphs are shape-identical
+// every frame (step s always sees n_past = s + 1), so the position and mask
+// inputs are constants filled at init.
+struct code_pred_graph {
+    struct ggml_context * ctx = nullptr;   // graph + tensor metadata
+    struct ggml_cgraph * gf = nullptr;
+    ggml_gallocr_t alloc = nullptr;        // intermediate tensors + logits
+
+    struct ggml_tensor * inp_hidden = nullptr;    // prefill only
+    struct ggml_tensor * inp_cb0_embd = nullptr;  // prefill only
+    struct ggml_tensor * inp_code = nullptr;      // steps only
+    struct ggml_tensor * logits = nullptr;
+};
+
 // TTS Transformer state
 struct tts_transformer_state {
     ggml_backend_t backend = nullptr;
@@ -206,6 +224,15 @@ struct tts_transformer_state {
     
     tts_kv_cache cache;           // Talker KV cache (28 layers)
     tts_kv_cache code_pred_cache; // Code predictor KV cache (5 layers)
+
+    // Persistent code-predictor graphs: [0] = 2-token prefill, [1..14] = steps.
+    // All their input tensors live in one dedicated buffer (like the KV cache)
+    // so the constant ones survive across computes.
+    std::vector<code_pred_graph> code_pred_graphs;
+    struct ggml_context * code_pred_inputs_ctx = nullptr;
+    ggml_backend_buffer_t code_pred_inputs_buffer = nullptr;
+    bool code_pred_graphs_ready = false;
+    bool code_pred_graphs_tried = false;
 };
 
 // TTS Transformer class
@@ -374,13 +401,23 @@ private:
     struct ggml_cgraph * build_code_pred_graph(int32_t n_prev_codes);
     
     // Build computation graph for single-step autoregressive code predictor
-    // n_past: number of tokens already in KV cache (0-14)
-    // generation_step: which codebook we're predicting (0-14)
-    struct ggml_cgraph * build_code_pred_step_graph(int32_t n_past, int32_t generation_step);
+    // generation_step: which codebook we're predicting (0-14); n_past is
+    // implied (generation_step + 1). Graph metadata goes in ctx0, input
+    // tensors in ctx_inputs (pass ctx0 for a throwaway graph).
+    struct ggml_cgraph * build_code_pred_step_graph(struct ggml_context * ctx0,
+                                                    struct ggml_context * ctx_inputs,
+                                                    int32_t generation_step);
     
     // Build computation graph for 2-token prefill of code predictor
     // Processes [past_hidden, codec_embd(codebook_0_token)] together
-    struct ggml_cgraph * build_code_pred_prefill_graph();
+    struct ggml_cgraph * build_code_pred_prefill_graph(struct ggml_context * ctx0,
+                                                       struct ggml_context * ctx_inputs);
+
+    // Build, allocate and pre-fill the 15 persistent code-predictor graphs.
+    // Returns false (leaving the scheduler path in use) if any op is not
+    // supported by the device backend.
+    bool init_code_pred_graphs();
+    void free_code_pred_graphs();
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);

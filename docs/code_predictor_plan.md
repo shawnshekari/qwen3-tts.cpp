@@ -164,6 +164,72 @@ per-sync number is a floor, not a typical.
 2. Precompute the 16 masks (one per `n_past`) at init.
 3. Convert the F32 down-projection to F16 in the GGUF (or cast at load).
 
+#### Phase 1 results (2026-09-10) — done, 17.4 -> 15.1 ms/frame on Vulkan
+
+| build | frame | talker | code pred | **Steps (14)** | steps compute | build+alloc |
+|---|---|---|---|---|---|---|
+| Vulkan before | 17.4 ms | 4.5 ms | 12.0 ms | 10.7 ms | 9.1 ms | 1.5 ms |
+| **Vulkan after** | **15.1 ms** | 4.1 ms | 10.1 ms | **8.9 ms** | 8.9 ms | 0 |
+| HIP before | 18.9 ms | 4.8 ms | 13.4 ms | 12.2 ms | 11.7 ms | 0.6 ms |
+| HIP after | 15.2 ms | 3.8 ms | 10.8 ms | 9.7 ms | 9.4 ms | 0 |
+| HIP + graphs after | 15.8 ms | 3.8 ms | 10.9 ms | 9.8 ms | 9.5 ms | 0 |
+
+RTF 0.27 -> 0.24 on Vulkan. What was actually done, and what it taught:
+
+- **Persistent graphs** (`init_code_pred_graphs`, `code_pred_graph` in
+  `tts_transformer.h`): the prefill graph and the 14 step graphs are built
+  once on the first frame, each with its own meta context and
+  `ggml_gallocr`, and run with `ggml_backend_graph_compute` on the device
+  backend directly — no scheduler. All input tensors of all 15 graphs live
+  in one dedicated buffer (like the KV cache), so the constant ones
+  (positions, and the mask for `n_past = step + 1`) are filled once at
+  init; that is item 2 for free, and it avoids `ggml_gallocr` reusing an
+  input's memory for an intermediate. Per step the host now does one
+  4-byte `tensor_set`, one compute, one 8 KB `tensor_get`. Every node is
+  checked with `ggml_backend_supports_op` at init; if anything is
+  unsupported (or `QWEN3_TTS_CODE_PRED_SCHED=1` is set, for A/B testing)
+  the old scheduler path is used. The graphs are dropped whenever the KV
+  cache is re-initialised.
+- **Verification:** with greedy decoding the persistent and scheduler paths
+  are bit-identical (`cmp` on the WAV) on Vulkan over 2048 frames, on HIP
+  over 40 frames (`QWEN3_TTS_DUMP_CODES`), and with the card deliberately
+  filled to 24.4 GB by a dummy allocator. One earlier pair, run while the
+  9B llama-server was also resident, did *not* match and could not be
+  reproduced afterwards; the likely mechanism is an allocation failure
+  under true exhaustion knocking some stage to CPU, not the graphs.
+- **Item 3 was misdiagnosed.** `ffn_down` is F16 in the GGUF; the graphs
+  *up-cast* it to F32 with `ggml_cast` on every run (5 per predictor step,
+  28 per talker frame — a 12 MB write + read per layer plus a dispatch).
+  Upstream added that cast to "mirror Python exactly" and it turns out to
+  matter: without it the HIP build runs away (every text generates to
+  `max_tokens`), because ggml-cuda's batched F16 GEMM accumulates in F16
+  on RDNA3 (`CUBLAS_COMPUTE_16F` unless CDNA/RDNA4), and `silu(gate)*up`
+  is where the big values are. The fix is `ggml_mul_mat_set_prec(...,
+  GGML_PREC_F32)` on the `ffn_down` matmuls: both backends then take the
+  F32-accumulate GEMM for batched (prefill) cases, while the decode
+  matvecs — already F32-accumulate — are untouched. Same guarantee, no
+  copy. Vulkan was fine either way (its F16xF32 matvec reads F32
+  directly and the 2-token prefill goes through the matvec path).
+- **HIP graphs are closed as a lever.** With persistent graphs the capture
+  finally engages (20 captures per run) and changes nothing: 9.8 vs 9.7
+  ms/frame. The per-dispatch cost is on the GPU side, as the Phase 0
+  analysis said; only fewer dispatches (Phase 2) moves it.
+- Step compute barely moved on Vulkan (9.1 -> 8.9 ms): dropping 5 casts
+  per step is offset by the F16 matvec path being no faster than the F32
+  one. The gain is all build+alloc. The remaining 0.9 ms/frame of "Data
+  I/O" is 14 synchronous 8 KB logits readbacks (~65 us each on Vulkan) —
+  that is what on-GPU sampling in Phase 2 removes.
+- **The HIP vocoder stalls the desktop.** A runaway 2048-frame request on
+  HIP held the GPU for minutes and Wayland got no time. Safeguards added:
+  the server takes `--max-tokens` (default 2048, like the CLI), and
+  `scripts/bench/bench_hip.sh` runs with `--max-tokens 400`, kills the
+  server if a request passes 300 frames or 120 s, and never lets the HIP
+  vocoder run on the long text. Both bench scripts refuse to start with
+  less than 5 GB of VRAM free and print VRAM before/after.
+- Both `build-hip*/` variants and `build-dev/` (Vulkan) are current; the
+  live service binary in `build/` has not been rebuilt — that is the
+  seed re-audition gate.
+
 ### Phase 2 — fused cooperative HIP kernel (1-2 weeks)
 
 One cooperative-groups kernel that runs an entire step with `grid.sync()`

@@ -263,6 +263,7 @@ struct server_params {
     int         top_k              = 50;
     float       repetition_penalty = 1.05f;
     int64_t     seed               = -1;
+    int         max_audio_tokens   = 2048;
 };
 
 // download a file from a huggingface repo, returns local cache path
@@ -347,6 +348,7 @@ static void print_usage(const char * program) {
     fprintf(stderr, "       --top-k <n>                 top-k sampling default (default: 50)\n");
     fprintf(stderr, "       --repetition-penalty <f>    repetition penalty default (default: 1.05)\n");
     fprintf(stderr, "       --seed <n>                  default sampling seed (default: -1 = random)\n");
+    fprintf(stderr, "       --max-tokens <n>            cap on audio frames per request (default: 2048)\n");
     fprintf(stderr, "  -h,  --help                     show this help\n");
 }
 
@@ -397,6 +399,9 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "--seed") {
             if (++i >= argc) { fprintf(stderr, "error: missing seed\n"); return false; }
             sp.seed = std::stoll(argv[i]);
+        } else if (arg == "--max-tokens") {
+            if (++i >= argc) { fprintf(stderr, "error: missing max-tokens\n"); return false; }
+            sp.max_audio_tokens = std::stoi(argv[i]);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             return false;
@@ -815,6 +820,7 @@ int main(int argc, char ** argv) {
         params.top_k              = top_k;
         params.repetition_penalty = repetition_penalty;
         params.seed               = seed;
+        params.max_audio_tokens   = sp.max_audio_tokens;
         params.language_id        = language_id;
         params.print_progress     = sp.verbose;
         params.print_timing       = sp.verbose;

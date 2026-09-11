@@ -9,6 +9,15 @@ LOG=$S/$LABEL.log
 MODEL=/home/sreed/tools/qwen3-tts.cpp/models/qwen3-tts-0.6b-f16.gguf
 TEXT="Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you, the whole thing fell apart."
 
+
+# VRAM guard: a test instance that spills into GTT measures 2x slow, so
+# refuse to run when the card is nearly full (BENCH_FORCE=1 overrides).
+vram() { cat /sys/class/drm/card*/device/mem_info_vram_used 2>/dev/null | awk '{s+=$1} END{printf "%.1f", s/1e9}'; }
+VRAM_TOTAL=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | awk '{s+=$1} END{printf "%.1f", s/1e9}')
+echo "VRAM before: $(vram) / $VRAM_TOTAL GB"
+if [ -z "${BENCH_FORCE:-}" ] && awk -v u="$(vram)" -v t="$VRAM_TOTAL" 'BEGIN{exit !(t - u < 5)}'; then
+  echo "less than 5 GB of VRAM free; stop the other GPU services first (or BENCH_FORCE=1)" >&2; exit 1
+fi
 pkill -f '^/home/sreed/tools/qwen3-tts.cpp/build[^ ]*/qwen3-tts-server' 2>/dev/null; sleep 1
 env "$@" "$BIN" -m "$MODEL" -p 8081 -V --seed 42 >"$LOG" 2>&1 &
 SPID=$!
@@ -30,3 +39,4 @@ kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
 awk '/Talker forward_step/{n++} n==2' "$LOG" | sed -n '1,30p'
 grep -E "Code generation|Vocoder decode|Total:|RTF" "$LOG" | tail -4
 ls -l "$S/$LABEL".*.wav | awk '{print $5, $9}'
+echo "VRAM after: $(vram) / $VRAM_TOTAL GB"

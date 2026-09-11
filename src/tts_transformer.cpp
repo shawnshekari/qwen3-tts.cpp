@@ -24,6 +24,8 @@ TTSTransformer::~TTSTransformer() {
 }
 
 void TTSTransformer::unload_model() {
+    free_code_pred_graphs();
+    state_.code_pred_graphs_tried = false;
     free_tts_kv_cache(state_.cache);
     free_tts_kv_cache(state_.code_pred_cache);
     free_transformer_model(model_);
@@ -831,6 +833,8 @@ void TTSTransformer::clear_kv_cache() {
 bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
     const auto & cfg = model_.config;
     
+    free_code_pred_graphs();
+    state_.code_pred_graphs_tried = false;
     free_tts_kv_cache(state_.code_pred_cache);
     
     state_.code_pred_cache.n_ctx = n_ctx;
@@ -1491,8 +1495,12 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         
         cur = ggml_mul(ctx0, gate, up);
         
-        struct ggml_tensor * ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, ffn_down_f32, cur);
+        // silu(gate)*up has the largest activations in the block; the batched
+        // (prefill) F16 GEMM on CUDA/HIP and Vulkan accumulates in F16 by
+        // default, which is enough to derail the code predictor on HIP.
+        // F32 accumulation here costs nothing on the decode matvec path.
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1607,8 +1615,7 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
         
-        struct ggml_tensor * KQ_mask = ggml_get_tensor(ctx0, "inp_mask");
-        cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask, KQscale, 0.0f, 0.0f);
+        cur = ggml_flash_attn_ext(ctx0, Q, K, V, inp_mask, KQscale, 0.0f, 0.0f);
         cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
         
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
@@ -1625,8 +1632,12 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
         
         cur = ggml_mul(ctx0, gate, up);
         
-        struct ggml_tensor * ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, ffn_down_f32, cur);
+        // silu(gate)*up has the largest activations in the block; the batched
+        // (prefill) F16 GEMM on CUDA/HIP and Vulkan accumulates in F16 by
+        // default, which is enough to derail the code predictor on HIP.
+        // F32 accumulation here costs nothing on the decode matvec path.
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1746,8 +1757,12 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
         
         cur = ggml_mul(ctx0, gate, up);
         
-        struct ggml_tensor * old_ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, old_ffn_down_f32, cur);
+        // silu(gate)*up has the largest activations in the block; the batched
+        // (prefill) F16 GEMM on CUDA/HIP and Vulkan accumulates in F16 by
+        // default, which is enough to derail the code predictor on HIP.
+        // F32 accumulation here costs nothing on the decode matvec path.
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1771,7 +1786,8 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
+struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph(struct ggml_context * ctx0,
+                                                                   struct ggml_context * ctx_inputs) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -1783,26 +1799,20 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
     const int n_layer = cfg.code_pred_layers;
     const int n_tokens = 2;
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    const size_t graph_size = ctx_inputs == ctx0 ? QWEN3_TTS_MAX_NODES : QWEN3_TTS_CODE_PRED_MAX_NODES;
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, graph_size, false);
 
     // Input: past_hidden from talker [hidden_size]
-    struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+    struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx_inputs, GGML_TYPE_F32, hidden_size);
     ggml_set_name(inp_hidden, "inp_hidden");
     ggml_set_input(inp_hidden);
 
     // Input: codebook 0 token embedding [hidden_size] (pre-computed using talker's codec_embd)
-    struct ggml_tensor * inp_cb0_embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+    struct ggml_tensor * inp_cb0_embd = ggml_new_tensor_1d(ctx_inputs, GGML_TYPE_F32, hidden_size);
     ggml_set_name(inp_cb0_embd, "inp_cb0_embd");
     ggml_set_input(inp_cb0_embd);
 
-    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx_inputs, GGML_TYPE_I32, n_tokens);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
 
@@ -1892,8 +1902,12 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         
         cur = ggml_mul(ctx0, gate, up);
         
-        struct ggml_tensor * ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, ffn_down_f32, cur);
+        // silu(gate)*up has the largest activations in the block; the batched
+        // (prefill) F16 GEMM on CUDA/HIP and Vulkan accumulates in F16 by
+        // default, which is enough to derail the code predictor on HIP.
+        // F32 accumulation here costs nothing on the decode matvec path.
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -1913,12 +1927,12 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
 
     ggml_build_forward_expand(gf, logits);
 
-    ggml_free(ctx0);
-
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past*/, int32_t generation_step) {
+struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(struct ggml_context * ctx0,
+                                                                struct ggml_context * ctx_inputs,
+                                                                int32_t generation_step) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -1929,34 +1943,28 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
     const int n_layer = cfg.code_pred_layers;
     const int n_tokens = 1;
 
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
+    const size_t graph_size = ctx_inputs == ctx0 ? QWEN3_TTS_MAX_NODES : QWEN3_TTS_CODE_PRED_MAX_NODES;
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, graph_size, false);
 
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
-
-    // inp_hidden is [hidden_size] (talker's dimension), used only for generation_step == 0
-    struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
-    ggml_set_name(inp_hidden, "inp_hidden");
-    ggml_set_input(inp_hidden);
-
-    struct ggml_tensor * inp_code = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    struct ggml_tensor * inp_code = ggml_new_tensor_1d(ctx_inputs, GGML_TYPE_I32, 1);
     ggml_set_name(inp_code, "inp_code");
     ggml_set_input(inp_code);
 
-    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx_inputs, GGML_TYPE_I32, 1);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
 
-    struct ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, state_.code_pred_cache.n_ctx, 1);
+    struct ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx_inputs, GGML_TYPE_F16, state_.code_pred_cache.n_ctx, 1);
     ggml_set_name(inp_mask, "inp_mask");
     ggml_set_input(inp_mask);
 
     struct ggml_tensor * cur;
     if (generation_step == 0) {
+        // inp_hidden is [hidden_size] (talker's dimension), only used when
+        // this graph stands in for the prefill
+        struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx_inputs, GGML_TYPE_F32, hidden_size);
+        ggml_set_name(inp_hidden, "inp_hidden");
+        ggml_set_input(inp_hidden);
         cur = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
     } else {
         cur = ggml_get_rows(ctx0, model_.code_pred_embd[generation_step - 1], inp_code);
@@ -2026,8 +2034,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
         
-        struct ggml_tensor * KQ_mask = ggml_get_tensor(ctx0, "inp_mask");
-        cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask, KQscale, 0.0f, 0.0f);
+        cur = ggml_flash_attn_ext(ctx0, Q, K, V, inp_mask, KQscale, 0.0f, 0.0f);
         cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
         
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
@@ -2044,8 +2051,12 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         
         cur = ggml_mul(ctx0, gate, up);
         
-        struct ggml_tensor * step_ffn_down_f32 = ggml_cast(ctx0, layer.ffn_down, GGML_TYPE_F32);
-        cur = ggml_mul_mat(ctx0, step_ffn_down_f32, cur);
+        // silu(gate)*up has the largest activations in the block; the batched
+        // (prefill) F16 GEMM on CUDA/HIP and Vulkan accumulates in F16 by
+        // default, which is enough to derail the code predictor on HIP.
+        // F32 accumulation here costs nothing on the decode matvec path.
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         
         inpL = ggml_add(ctx0, cur, inpFF);
     }
@@ -2061,9 +2072,134 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
      
      ggml_build_forward_expand(gf, logits);
     
-    ggml_free(ctx0);
-    
     return gf;
+}
+
+bool TTSTransformer::init_code_pred_graphs() {
+    free_code_pred_graphs();
+    state_.code_pred_graphs_tried = true;
+    error_msg_.clear();
+
+    const auto & cfg = model_.config;
+    const int n_ctx = state_.code_pred_cache.n_ctx;
+    const int n_graphs = 15;  // prefill + 14 steps
+
+    // All input tensors of all graphs share one context/buffer
+    {
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * n_graphs * 4,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        state_.code_pred_inputs_ctx = ggml_init(params);
+        if (!state_.code_pred_inputs_ctx) {
+            error_msg_ = "Failed to create code predictor inputs context";
+            return false;
+        }
+    }
+
+    const size_t meta_size = ggml_tensor_overhead() * QWEN3_TTS_CODE_PRED_MAX_NODES
+                           + ggml_graph_overhead_custom(QWEN3_TTS_CODE_PRED_MAX_NODES, false);
+
+    state_.code_pred_graphs.resize(n_graphs);
+    for (int g = 0; g < n_graphs; ++g) {
+        code_pred_graph & cg = state_.code_pred_graphs[g];
+
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ meta_size,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        cg.ctx = ggml_init(params);
+        if (!cg.ctx) {
+            error_msg_ = "Failed to create code predictor graph context";
+            free_code_pred_graphs();
+            return false;
+        }
+
+        cg.gf = g == 0 ? build_code_pred_prefill_graph(cg.ctx, state_.code_pred_inputs_ctx)
+                       : build_code_pred_step_graph(cg.ctx, state_.code_pred_inputs_ctx, g);
+        cg.inp_hidden   = ggml_graph_get_tensor(cg.gf, "inp_hidden");
+        cg.inp_cb0_embd = ggml_graph_get_tensor(cg.gf, "inp_cb0_embd");
+        cg.inp_code     = ggml_graph_get_tensor(cg.gf, "inp_code");
+        cg.logits       = ggml_graph_get_tensor(cg.gf, "logits");
+
+        // The graphs run on the device backend without the scheduler, so
+        // every op has to be supported there; otherwise keep the old path.
+        for (int i = 0; i < ggml_graph_n_nodes(cg.gf); ++i) {
+            struct ggml_tensor * node = ggml_graph_node(cg.gf, i);
+            if (!ggml_backend_supports_op(state_.backend, node)) {
+                fprintf(stderr, "  code predictor: op %s (%s) not supported by %s, using scheduler path\n",
+                        ggml_op_name(node->op), node->name, ggml_backend_name(state_.backend));
+                free_code_pred_graphs();
+                return false;
+            }
+        }
+    }
+
+    state_.code_pred_inputs_buffer = ggml_backend_alloc_ctx_tensors(state_.code_pred_inputs_ctx, state_.backend);
+    if (!state_.code_pred_inputs_buffer) {
+        error_msg_ = "Failed to allocate code predictor inputs buffer";
+        free_code_pred_graphs();
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(state_.backend);
+    std::vector<ggml_fp16_t> mask(n_ctx);
+    for (int g = 0; g < n_graphs; ++g) {
+        code_pred_graph & cg = state_.code_pred_graphs[g];
+        cg.alloc = ggml_gallocr_new(buft);
+        if (!cg.alloc || !ggml_gallocr_alloc_graph(cg.alloc, cg.gf)) {
+            error_msg_ = "Failed to allocate code predictor graph";
+            free_code_pred_graphs();
+            return false;
+        }
+
+        // Constant inputs: positions, and the causal mask for n_past = g + 1
+        struct ggml_tensor * inp_pos = ggml_graph_get_tensor(cg.gf, "inp_pos");
+        if (g == 0) {
+            const int32_t positions[2] = {0, 1};
+            ggml_backend_tensor_set(inp_pos, positions, 0, sizeof(positions));
+        } else {
+            const int32_t pos = g + 1;
+            ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(pos));
+
+            for (int i = 0; i < n_ctx; ++i) {
+                mask[i] = ggml_fp32_to_fp16(i <= g + 1 ? 0.0f : -INFINITY);
+            }
+            struct ggml_tensor * inp_mask = ggml_graph_get_tensor(cg.gf, "inp_mask");
+            ggml_backend_tensor_set(inp_mask, mask.data(), 0, n_ctx * sizeof(ggml_fp16_t));
+        }
+    }
+
+    if (verbose_) {
+        size_t bytes = ggml_backend_buffer_get_size(state_.code_pred_inputs_buffer);
+        for (auto & cg : state_.code_pred_graphs) {
+            bytes += ggml_gallocr_get_buffer_size(cg.alloc, 0);
+        }
+        fprintf(stderr, "  code predictor: %d persistent graphs on %s (%.1f MB), vocab=%d\n",
+                n_graphs, ggml_backend_name(state_.backend), bytes / (1024.0 * 1024.0), cfg.code_pred_vocab_size);
+    }
+
+    state_.code_pred_graphs_ready = true;
+    return true;
+}
+
+void TTSTransformer::free_code_pred_graphs() {
+    for (auto & cg : state_.code_pred_graphs) {
+        if (cg.alloc) ggml_gallocr_free(cg.alloc);
+        if (cg.ctx) ggml_free(cg.ctx);
+    }
+    state_.code_pred_graphs.clear();
+    if (state_.code_pred_inputs_buffer) {
+        ggml_backend_buffer_free(state_.code_pred_inputs_buffer);
+        state_.code_pred_inputs_buffer = nullptr;
+    }
+    if (state_.code_pred_inputs_ctx) {
+        ggml_free(state_.code_pred_inputs_ctx);
+        state_.code_pred_inputs_ctx = nullptr;
+    }
+    state_.code_pred_graphs_ready = false;
 }
 
 bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_tokens,
@@ -2637,11 +2773,103 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     if (!lookup_single_embedding_row(model_.codec_embd, codebook_0_token, cb0_embd.data())) {
         return false;
     }
+
+    // Persistent graphs (first frame builds them; falls back to the
+    // scheduler path below if the device backend can't run them, or when
+    // QWEN3_TTS_CODE_PRED_SCHED=1 forces the old path for A/B testing)
+    if (!state_.code_pred_graphs_ready && !state_.code_pred_graphs_tried) {
+        const char * force_sched = std::getenv("QWEN3_TTS_CODE_PRED_SCHED");
+        if (force_sched && force_sched[0] == '1') {
+            state_.code_pred_graphs_tried = true;
+        } else if (!init_code_pred_graphs() && !error_msg_.empty()) {
+            return false;
+        }
+    }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_code_pred_init_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-    
+
+    if (state_.code_pred_graphs_ready) {
+        // Prefill with 2 tokens [past_hidden, cb0_embd]
+        {
+#ifdef QWEN3_TTS_TIMING
+            auto t_pf_start = clk::now();
+            t0 = clk::now();
+#endif
+            code_pred_graph & cg = state_.code_pred_graphs[0];
+            ggml_backend_tensor_set(cg.inp_hidden, hidden, 0, cfg.hidden_size * sizeof(float));
+            ggml_backend_tensor_set(cg.inp_cb0_embd, cb0_embd.data(), 0, cfg.hidden_size * sizeof(float));
+#ifdef QWEN3_TTS_TIMING
+            t1 = clk::now();
+            if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            t0 = t1;
+#endif
+            if (ggml_backend_graph_compute(state_.backend, cg.gf) != GGML_STATUS_SUCCESS) {
+                error_msg_ = "Failed to compute code predictor prefill graph";
+                return false;
+            }
+#ifdef QWEN3_TTS_TIMING
+            t1 = clk::now();
+            if (timing_) timing_->t_code_pred_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            t0 = t1;
+#endif
+            ggml_backend_tensor_get(cg.logits, logits_data.data(), 0, cfg.code_pred_vocab_size * sizeof(float));
+            output[0] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
+#ifdef QWEN3_TTS_TIMING
+            t1 = clk::now();
+            if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (timing_) timing_->t_code_pred_prefill_ms += std::chrono::duration<double, std::milli>(t1 - t_pf_start).count();
+#endif
+        }
+
+        // Generate 14 more tokens autoregressively; step s has n_past = s + 1
+        // baked into its graph, only the previous code changes.
+#ifdef QWEN3_TTS_TIMING
+        auto t_steps_start = clk::now();
+#endif
+        for (int step = 1; step < 15; ++step) {
+#ifdef QWEN3_TTS_TIMING
+            t0 = clk::now();
+#endif
+            code_pred_graph & cg = state_.code_pred_graphs[step];
+            const int32_t prev_code = output[step - 1];
+            ggml_backend_tensor_set(cg.inp_code, &prev_code, 0, sizeof(int32_t));
+#ifdef QWEN3_TTS_TIMING
+            t1 = clk::now();
+            if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            t0 = t1;
+#endif
+            if (ggml_backend_graph_compute(state_.backend, cg.gf) != GGML_STATUS_SUCCESS) {
+                error_msg_ = "Failed to compute code predictor step graph";
+                return false;
+            }
+#ifdef QWEN3_TTS_TIMING
+            t1 = clk::now();
+            if (timing_) timing_->t_code_pred_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            t0 = t1;
+#endif
+            ggml_backend_tensor_get(cg.logits, logits_data.data(), 0, cfg.code_pred_vocab_size * sizeof(float));
+            output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
+#ifdef QWEN3_TTS_TIMING
+            t1 = clk::now();
+            if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
+        }
+#ifdef QWEN3_TTS_TIMING
+        if (timing_) timing_->t_code_pred_steps_ms += std::chrono::duration<double, std::milli>(clk::now() - t_steps_start).count();
+#endif
+        return true;
+    }
+
+    // Scheduler path: rebuild and reallocate every graph (needed when some
+    // op has to fall back to the CPU backend)
+    struct ggml_init_params meta_params = {
+        /*.mem_size   =*/ state_.compute_meta.size(),
+        /*.mem_buffer =*/ state_.compute_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
     // Prefill with 2 tokens [past_hidden, cb0_embd]
     {
 #ifdef QWEN3_TTS_TIMING
@@ -2651,7 +2879,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = build_code_pred_prefill_graph();
+        struct ggml_context * ctx0 = ggml_init(meta_params);
+        struct ggml_cgraph * gf = build_code_pred_prefill_graph(ctx0, ctx0);
+        ggml_free(ctx0);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2739,7 +2969,9 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = build_code_pred_step_graph(n_past, step);
+        struct ggml_context * ctx0 = ggml_init(meta_params);
+        struct ggml_cgraph * gf = build_code_pred_step_graph(ctx0, ctx0, step);
+        ggml_free(ctx0);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
