@@ -1,5 +1,5 @@
 # Build
-build/
+build*/
 
 # Forensics artifacts (scratch audio / code dumps / soak logs)
 forensics/audio/

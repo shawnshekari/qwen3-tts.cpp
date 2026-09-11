@@ -84,6 +84,79 @@ the home for Phase 2.
 Risk: the vendored ggml (`d4fcfe88`, April 2026) may not compile against a
 ROCm 10.1 nightly.
 
+#### Phase 0 results (2026-09-10, ROCm 10.1.0a20260822 in `navi31-llama`)
+
+Same text (131 chars), same voice, seed 42, second request of each server
+(warm), `llama-server` resident but the test instance fully in VRAM.
+Harness: `scripts/bench/bench_vulkan.sh <label> <binary>` and
+`scripts/bench/bench_hip.sh <label> <binary>` (the latter runs the binary
+inside `navi31-llama` and kills the server before the vocoder runs);
+`tts-engine` must be stopped first. Timing blocks and WAVs land in
+`$BENCH_OUT` (default `/tmp/qwen3-tts-bench`).
+
+| build | frame | talker | code pred | **Steps (14)** | steps compute | steps alloc |
+|---|---|---|---|---|---|---|
+| Vulkan (RADV) | 17.4 ms | 4.5 ms | 12.0 ms | **10.7 ms** | 9.1 ms | 1.3 ms |
+| HIP | 18.9 ms | 4.8 ms | 13.4 ms | **12.2 ms** | 11.7 ms | 0.4 ms |
+| HIP + `GGML_HIP_GRAPHS` | 19.2 ms | 4.8 ms | 13.4 ms | **12.2 ms** | 11.7 ms | 0.4 ms |
+
+- **ROCm's per-dispatch cost is higher than RADV's, not lower.** Per step:
+  836 us on HIP vs 650 us on Vulkan. Against the ~180 us bandwidth floor
+  and 128 dispatches that is ~5.1 us vs ~3.7 us per dispatch. The plain HIP
+  build is a ~10% loss on the frame, so HIP is not a drop-in win for this
+  stage; the only reason to go there remains Phase 2 (grid-wide sync).
+  `sched_alloc` is 3x cheaper on HIP (0.4 vs 1.3 ms/frame) but that is
+  Phase 1 territory on either backend.
+- **HIP graphs never engage on the step graphs.** `GGML_HIP_GRAPHS` is a
+  *compile-time* ggml option (separate build, `build-hip-graphs/`), and
+  ggml-cuda keys a captured graph on `cgraph->nodes[0]` and only captures
+  after two consecutive computes with identical node properties. The loop
+  rebuilds each step graph with a different `n_past`, so warmup resets every
+  step (`GGML_LOG_DEBUG` shows 4 "warmup complete" in the whole run, none
+  in the predictor). Re-test after Phase 1 step 1 makes the graphs
+  persistent; until then the graphs number is meaningless.
+- The vendored ggml compiles unchanged against the ROCm 10.1 nightly.
+  The toolchain itself needs a workaround: the nightly's clang 23 ships no
+  host `libclang_rt.builtins.a` and `hip-lang-config.cmake` forces
+  `--rtlib=compiler-rt`, so every HIP link fails. Build with
+  `-DCMAKE_HIP_FLAGS=-resource-dir=$HOME/.local/share/rocm-clangrt-overlay`
+  (a mirror of the ROCm clang resource dir plus Fedora's compiler-rt 22
+  builtins; see the README in that dir). Durable fix for the Dockerfile's
+  final stage: `dnf install compiler-rt` and symlink its builtins into
+  `/opt/rocm/lib/llvm/lib/clang/23/lib/x86_64-unknown-linux-gnu/`.
+- **The vocoder must not run on HIP.** All its ops land on `ROCm0` (2
+  splits) but decode takes ~430 ms per frame — 9.8 s for 1.8 s of audio,
+  vs ~4 ms/frame on Vulkan — and a 158-frame decode hogged the GPU hard
+  enough to stall the desktop. Not investigated (the plan keeps the
+  vocoder on Vulkan); likely the naive `conv_transpose_1d` kernel in
+  ggml-cuda. The HIP binaries are only usable for measuring the talker and
+  code predictor.
+- The HIP build binaries link against the container's glibc 2.43 and only
+  run inside `toolbox run --container navi31-llama`.
+- Sampled codes differ from Vulkan for the same seed (147 vs 158 frames),
+  as expected from the arithmetic-order caveat under Constraints.
+
+**grid.sync() microbench** (`scripts/bench_gridsync.hip`, same toolbox),
+which is the number Phase 2's estimate hinges on:
+
+| grid (256 threads/block) | cooperative launch | per `grid.sync()` |
+|---|---|---|
+| 48 blocks (1/CU) | 21 us | 0.78 us |
+| 96 blocks (2/CU) | 15 us | 0.56 us |
+| 192 blocks (4/CU) | 13 us | 0.61 us |
+| 384 blocks (8/CU) | 23 us | 1.06 us |
+
+Back-to-back empty kernel launches on one stream cost 4.7 us each, which
+independently confirms the ~5 us/dispatch derived from the ggml numbers
+above. So a grid-wide barrier is **5-8x cheaper than a dispatch** on this
+card, and the plan's "~5 us per sync" assumption is conservative by that
+factor: ~30 syncs/step is ~20-30 us, not ~150 us. The Phase 2 step is then
+bounded by weight streaming (~180-250 us), giving **~250-300 us/step,
+~4 ms/frame** for the code predictor rather than the 5-6 ms estimated
+above. Caveat: the bench syncs with no real work between barriers; with
+matvec phases the barrier also waits for the slowest block, so the
+per-sync number is a floor, not a typical.
+
 ### Phase 1 — ggml-level cleanups (about a day, ~15%, backend-agnostic)
 
 1. Build and allocate the prefill graph and the 14 step graphs once, keep
