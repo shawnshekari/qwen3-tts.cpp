@@ -576,6 +576,16 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
     return ggml_add(ctx, residual, ffn_out);
 }
 
+// The Vulkan CONV_TRANSPOSE_1D kernel only accepts an F32 weight (and F32
+// input); with the F16 weights shipped in the tokenizer GGUF the scheduler
+// bounced every transposed conv to the CPU, copying the activations (up to
+// ~45 MB at the last decoder block) across the bus both ways. Casting the
+// small weight tensor in-graph keeps the whole vocoder on the GPU. The cast
+// runs on the backend and is a no-op for models that already store F32.
+static struct ggml_tensor * conv_transpose_weight_f32(struct ggml_context * ctx, struct ggml_tensor * w) {
+    return w->type == GGML_TYPE_F32 ? w : ggml_cast(ctx, w, GGML_TYPE_F32);
+}
+
 struct ggml_tensor * AudioTokenizerDecoder::apply_upsample_block(struct ggml_context * ctx,
                                                                    struct ggml_tensor * x,
                                                                    const upsample_block & block,
@@ -584,7 +594,7 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_upsample_block(struct ggml_con
     int64_t channels = x->ne[1];
 
      struct ggml_tensor * x_2d = ggml_reshape_2d(ctx, x, seq_len, channels);
-     x_2d = ggml_conv_transpose_1d(ctx, block.conv_w, x_2d, 2, 0, 1);
+     x_2d = ggml_conv_transpose_1d(ctx, conv_transpose_weight_f32(ctx, block.conv_w), x_2d, 2, 0, 1);
 
      int64_t new_seq_len = x_2d->ne[0];
      x = ggml_reshape_3d(ctx, x_2d, new_seq_len, channels, 1);
@@ -686,7 +696,7 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
      int kernel_size = block.conv_t_w->ne[0];
      
      struct ggml_tensor * x_2d = ggml_reshape_2d(ctx, x, seq_len, in_channels);
-     x_2d = ggml_conv_transpose_1d(ctx, block.conv_t_w, x_2d, upsample_rate, 0, 1);
+     x_2d = ggml_conv_transpose_1d(ctx, conv_transpose_weight_f32(ctx, block.conv_t_w), x_2d, upsample_rate, 0, 1);
      
      int64_t new_seq_len = x_2d->ne[0];
      x = ggml_reshape_3d(ctx, x_2d, new_seq_len, out_channels, 1);
