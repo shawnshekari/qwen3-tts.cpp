@@ -186,7 +186,52 @@ GLSL version would still be ~10 dispatches per step.
 - **Q8/FP4 weights or FP4 training**: bandwidth is ~15% of the frame;
   Strix Halo numbers with 4x less bandwidth are identical. Not the
   bottleneck on either machine.
-- **Moving upstream**: khimaros has been dormant since 2026-06-16 (PRs #3
-  and #4 unreviewed since June 19); predict-woo has no server or streaming
-  and issue #20 (the vocoder-on-CPU bug) has been open since March.
-  `shawnshekari/qwen3-tts.cpp` is the maintained copy.
+- **Moving upstream**: see "Upstream status" below. Neither upstream is a
+  better base than this fork.
+
+## Upstream status and how to submit later
+
+Lineage: `predict-woo/qwen3-tts.cpp` (original ggml port, remote `upstream`)
+-> `khimaros/qwen3-tts.cpp` (server, streaming, flash-attn, 1.7B; remote
+`origin`) -> `shawnshekari/qwen3-tts.cpp` (this fork, remote `shawnshekari`).
+
+As of 2026-09-10:
+
+- **khimaros** last pushed 2026-06-16 (`0c8b2ba`). Our PRs #3 (libav
+  compat) and #4 (Vulkan RPATH / httplib flags) have been open since
+  2026-06-19 with no response; #2 (CORS, another contributor) likewise.
+  Treat as dormant. Everything after `0c8b2ba` in this repo's history is
+  ours, including the June Strix Halo baseline docs.
+- **predict-woo** last pushed 2026-07-18; merges small build PRs but closed
+  the one performance PR (#28). No server, no streaming (open issues #23,
+  #25). Issue **#20** — "Vocoder decode runs on CPU despite Vulkan backend:
+  backend/buffer mismatch in load_tensor_data_from_file" — is exactly
+  `b11fd22`, open since 2026-03-27. Their `gguf_loader.cpp` moved the
+  logic into `init_tensor_loader_backend()` (same bug at the
+  `preferred -> CPU` fallback) and their decoder gained CUDA chunked
+  decode, so our commits do not cherry-pick cleanly onto their tree.
+
+Not submitted anywhere yet: `b11fd22` (IGPU -> GPU fallback) and
+`cebfbd3` (F32 cast for transposed convs).
+
+If submitting later, the target with a live maintainer and a matching open
+issue is predict-woo. This is a cherry-pick of two small fixes onto their
+tree for the PR only — the working base stays here, do not rebase this
+fork onto predict-woo (their decoder rewrite conflicts with the server and
+streaming work).
+
+```bash
+git fetch upstream
+git checkout -b pr/dgpu-vocoder upstream/main
+git cherry-pick cebfbd3          # applies with line-offset only
+git cherry-pick b11fd22          # will conflict: re-apply the IGPU->GPU
+                                 # retry inside init_tensor_loader_backend()
+cmake -S . -B build-pr -DGGML_VULKAN=ON -DQWEN3_TTS_TIMING=ON && cmake --build build-pr -j
+```
+
+Then re-measure on *their* build (`-V`, vocoder decode ms before/after,
+`GGML_SCHED_DEBUG=1` split count) so the PR's numbers are for their code.
+In the PR body: reference #20, quote the before/after, and state in one
+line that the fix was found with AI-assisted profiling. Keep it to those
+two commits. If it sits unmerged, it costs nothing; the fork stays the
+working copy either way.
