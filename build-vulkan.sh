@@ -43,7 +43,9 @@ cmake --build ggml/build -j
 echo ""
 echo "=== Building qwen3-tts.cpp ==="
 rm -rf build
-cmake -S . -B build -DGGML_VULKAN=ON
+cmake -S . -B build \
+  -DGGML_VULKAN=ON \
+  -DQWEN3_TTS_TIMING=ON
 cmake --build build -j
 
 echo ""
