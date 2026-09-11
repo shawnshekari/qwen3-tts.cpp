@@ -232,6 +232,25 @@ RTF 0.27 -> 0.24 on Vulkan. What was actually done, and what it taught:
 
 ### Phase 2 — fused cooperative HIP kernel (1-2 weeks)
 
+#### Step 0 result (2026-09-10): the process goes all-HIP, no mixed backend
+
+The "HIP vocoder is 100x slower" finding from Phase 0 was one kernel:
+`rocprofv3 --kernel-trace --stats` on a 13-frame decode put 95.7% of
+GPU time in `conv_transpose_1d_kernel` (6 calls, up to 2.5 s each). The
+vendored ggml-cuda kernel iterated over *every* input position per
+output element and `continue`d outside the kernel window — O(L_in)
+instead of O(K) per output. Fixed in `ggml/src/ggml-cuda/conv-transpose-1d.cu`
+by computing the valid input range; same summation order, so the
+output is bit-identical. Decode 3578 -> 19 ms on that test. (Worth
+sending upstream to ggml.)
+
+With that, a full request on HIP: 139 frames at 15.1 ms/frame, vocoder
+167 ms (1.2 ms/frame vs 3.9 on Vulkan), **RTF 0.205 vs 0.239 on Vulkan**.
+So Phase 2 targets an all-HIP process: talker, code predictor and
+vocoder on ROCm0, the fused kernel slotting in behind the CoreML seam,
+and the service running inside the toolbox the way `llama-server.service`
+already does. No Vulkan+HIP plumbing.
+
 One cooperative-groups kernel that runs an entire step with `grid.sync()`
 between phases instead of 128 dispatches, and loops all 14 steps inside a
 single launch:
