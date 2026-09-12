@@ -2,7 +2,7 @@
 
 ## Added In This Fork
 
-This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) layers the following on top of [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp):
+This fork ([shawnshekari/qwen3-tts.cpp](https://github.com/shawnshekari/qwen3-tts.cpp)) continues the work of [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp), which itself layered the following on top of [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp):
 
 - **1.7B model support** with MTP projection bridging the 2048-dim talker and 1024-dim code predictor, plus dynamic model detection
 - **ICL voice cloning** via Mimi codec encoder — reference audio is encoded to discrete speech codes and combined with `ref_text` in prefill, as an alternative to x-vector speaker embeddings
@@ -18,6 +18,16 @@ This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) 
 - **Real token accounting** in `tts_result` (text / prefill / audio tokens, plus prefill time broken out of total generate time) for accurate OpenAI `usage` reporting
 - **Multi-variant model support** (Base / CustomVoice / VoiceDesign) with speaker presets and language IDs stored in GGUF metadata
 - **Batch model conversion** script that downloads and converts all Qwen3-TTS variants in one shot
+
+This fork adds discrete-GPU support and performance work:
+
+- **Discrete GPU (dGPU) fixes**: the vocoder no longer silently falls back to CPU on discrete cards (IGPU-only weight-loading fallback), and its transposed convolutions stay on the GPU via an F16→F32 weight cast (Vulkan's `CONV_TRANSPOSE_1D` is F32-only)
+- **Persistent code-predictor graphs**: the prefill + 14 step graphs are built once and reused across frames with direct device compute (no per-frame graph build/alloc or scheduler), verified bit-identical to the scheduler path under greedy decoding
+- **Bounded vocoder memory**: one-shot `decode()` now runs through the streaming decoder in 64-frame chunks, so a long request no longer pins gigabytes of high-water-mark scratch until restart
+
+### dGPU Performance
+
+On an AMD RX 7900 XTX (0.6B F16, Vulkan): **15.1 ms/frame, RTF 0.24** — roughly 4x faster than real time, down from 17.4 ms/frame before the fixes above. The full profiling write-up, per-stage breakdown, and the in-progress ROCm/fused-kernel work are in [`docs/code_predictor_plan.md`](docs/code_predictor_plan.md).
 
 ### HuggingFace Models
 
