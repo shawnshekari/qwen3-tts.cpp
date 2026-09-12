@@ -720,6 +720,13 @@ int main(int argc, char ** argv) {
         int         stream_batch_size  = body.value("stream_batch_size", 0);
         if (stream_batch_size < 0) stream_batch_size = 0;
         if (stream_batch_size > 256) stream_batch_size = 256;
+        // Per-request frame budget. A client that knows how long its text
+        // should take can stop a runaway (no EOS) at generation time instead
+        // of paying for --max-tokens frames of babble. Clamped to the
+        // server-wide cap so a request can never raise it.
+        int         max_audio_tokens   = body.value("max_audio_tokens", sp.max_audio_tokens);
+        if (max_audio_tokens < 1) max_audio_tokens = 1;
+        if (max_audio_tokens > sp.max_audio_tokens) max_audio_tokens = sp.max_audio_tokens;
 
         fprintf(stderr, "request: voice=%s lang=%s fmt=%s temp=%.2f seed=%lld len=%zu\n",
                 voice.empty() ? "default" : voice.c_str(),
@@ -820,7 +827,7 @@ int main(int argc, char ** argv) {
         params.top_k              = top_k;
         params.repetition_penalty = repetition_penalty;
         params.seed               = seed;
-        params.max_audio_tokens   = sp.max_audio_tokens;
+        params.max_audio_tokens   = max_audio_tokens;
         params.language_id        = language_id;
         params.print_progress     = sp.verbose;
         params.print_timing       = sp.verbose;
