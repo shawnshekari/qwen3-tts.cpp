@@ -26,6 +26,12 @@ ms/frame, RTF ~0.14, zero fallbacks.
 - The toolbox `build-hip/` is no longer used by the service (kept for
   reference). The host `build-hip-host/` is the production build.
 
+> ⚠️ **LIVE REGRESSION (2026-09-12):** the running process has latched
+> both fused kernels to GGML after barrier timeouts under contention —
+> RTF is ~0.21, not the ~0.13/0.14 fused steady state. Restart the
+> engine on a quiet GPU to recover. See **KNOWN ISSUE** below for the
+> full diagnosis and the deferred self-healing discussion.
+
 ## Next session: single fused talker+cp kernel
 
 The remaining big lever is **one cooperative launch per frame** that
@@ -152,6 +158,59 @@ falling back` and restart the engine on a quieter GPU. Rollback: remove
 the two `Environment=` fused flags (or restore
 `/tmp/tts-engine.service.bak`) + daemon-reload + restart, and restore
 seed pins to 42.
+
+## KNOWN ISSUE — permanent latch under contention degrades RTF (self-healing deferred)
+
+**Symptom (observed 2026-09-12):** client RTF climbed from the ~0.13
+fused steady state to **0.21** and stayed there. Per-request timing in
+the journal showed `Code predictor Backend: GGML` (not fused), talker
+3.8 ms/frame + cp 10.8 ms/frame ≈ 15.8 ms/frame, vs the fused
+2.2 + 6.6 ≈ 9 ms/frame.
+
+**Root cause:** the fused talker and fused cp each hit a `grid barrier
+timed out` under GPU contention and latched to GGML for the **whole
+process lifetime** (`hip_talker_failed_` / `hip_code_pred_failed_` are
+one-way latches). Trigger was `llama-server` ×2 + `embedding-server`
+resident at 100% GPU util / 88% VRAM — the cooperative grids couldn't
+get a full-residency slice inside the spin deadline, so they aborted and
+latched. This is the Gate-3 caveat above, now actually observed in
+production.
+
+**Why it's sticky:** the latch is intentionally one-way (correctness:
+once a barrier timeout is seen, the process never trusts the cooperative
+grid again). That makes a *single transient* contention spike permanently
+degrade the process until restart — the fused path never comes back on
+its own.
+
+**Why the fused-frame kernel does NOT help here:** `k_frame_fused` has
+the *same* cooperative full-residency requirement, so under this
+contention it would time out and fall back too. Frame fusion reduces
+launch/sync overhead on a *schedulable* GPU; it does not make the grid
+easier to schedule. (Measured occupancy is unchanged at 4 blocks/CU.)
+
+**Immediate remedy (operational, not code):** restart `tts-engine` when
+the GPU is quiet (llama-server/embedding idle) so the fused path
+re-engages. Restarting *during* saturation just re-times-out and
+re-latches (and risks the voice-registration race — see Gate 3).
+
+**Deferred design discussion — self-healing (NOT implemented yet).**
+Candidate directions to evaluate later:
+- *Auto-unlatch with cooldown:* after latching, periodically (e.g. every
+  N requests or T seconds) probe the cooperative grid with a single
+  cheap frame; if it succeeds, un-latch and resume the fused path.
+- *Per-frame retry instead of process latch:* don't latch permanently;
+  retry the fused path each frame and only fall back for the frame that
+  timed out. (Cost: a timed-out frame wastes the spin deadline before
+  falling back — need to bound the deadline so the fallback is still
+  faster than GGML.)
+- *Adaptive spin deadline:* widen the barrier spin cap when the GPU is
+  known-busy so the cooperative grid gets a longer slice before timing
+  out (trades latency for fewer latches).
+- *Contention-aware scheduling:* have the engine observe GPU utilization
+  and defer/pace fused launches when co-resident load is high.
+None of these are started. Decide the policy before writing code — the
+correctness invariant (seen[] re-sync across the fused/GGML boundary,
+Gate 1) must hold for whichever retry path is chosen.
 
 ## Enabling, once gates pass
 
