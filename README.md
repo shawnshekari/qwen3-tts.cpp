@@ -29,6 +29,39 @@ This fork adds discrete-GPU support and performance work:
 
 On an AMD RX 7900 XTX (0.6B F16, Vulkan): **15.1 ms/frame, RTF 0.24** — roughly 4x faster than real time, down from 17.4 ms/frame before the fixes above. The full profiling write-up, per-stage breakdown, and the in-progress ROCm/fused-kernel work are in [`docs/code_predictor_plan.md`](docs/code_predictor_plan.md).
 
+```mermaid
+flowchart LR
+    TEXT["Text"] --> TOK["BPE text tokenizer"]
+    REF["Reference audio"] --> SPK["Speaker encoder<br/>(ECAPA-TDNN)"]
+    TOK --> PF["Prefill embeddings"]
+    SPK --> PF
+    PF --> TALKER["Talker<br/>28-layer Qwen2<br/>~4.1 ms/frame"]
+    TALKER -->|"hidden state<br/>+ codebook-0 code"| CP["Code predictor<br/>5 layers, 14 AR steps<br/>~10.1 ms/frame"]
+    CP -->|"16 codebooks<br/>per frame"| VOC["Vocoder<br/>WavTokenizer<br/>~2 ms/frame"]
+    VOC --> OUT["24 kHz audio"]
+
+    CP -.->|"swap-in seam"| FUSED["Fused cooperative<br/>HIP kernel<br/>one launch per frame"]
+
+    subgraph legend ["Legend"]
+        direction LR
+        L1["inherited from upstream"] ~~~ L2["fixed/optimized in this fork"] ~~~ L3["in progress (Phase 2)"]
+    end
+
+    classDef upstream fill:#ececec,stroke:#999,color:#333
+    classDef ours fill:#d5ebd5,stroke:#3a7d3a,color:#1a3a1a
+    classDef wip fill:#ffe4cc,stroke:#cc7a29,color:#5a3510
+    class TOK,SPK,PF,TALKER,OUT,L1 upstream
+    class CP,VOC,L2 ours
+    class FUSED,L3 wip
+```
+
+The code predictor is the hot spot: it was ~12 ms/frame with a graph rebuild,
+allocation and scheduler round-trip on every one of its 14 steps per frame.
+Persistent graphs removed that overhead; the fused-kernel work aims to replace
+the 128 kernel launches per step with a single cooperative launch (~4 ms/frame
+target). The vocoder stages are shown as they run today on Vulkan; on ROCm the
+same stages hit ~1.2 ms/frame after the `conv_transpose_1d` fix.
+
 ### HuggingFace Models
 
 Pre-converted GGUF artifacts are published in the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts):
