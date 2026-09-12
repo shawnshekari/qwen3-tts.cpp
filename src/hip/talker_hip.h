@@ -93,6 +93,16 @@ public:
              int32_t * cb0_out, float * hidden_out, float * logits_out,
              bool fused, std::string * err);
 
+    // Device-resident variant: `d_step_embd` is a DEVICE pointer to the
+    // step embedding (e.g. HipCodePredictor::device_step_embd()), so the
+    // host->device copy is replaced by a device-to-device copy into the
+    // residual buffer. Same semantics as run() otherwise.
+    bool run_device(const float * d_step_embd, int32_t n_past, const tl_kv & kv,
+                    float temperature, int32_t top_k, float repetition_penalty,
+                    int32_t eos_id, uint64_t seed,
+                    int32_t * cb0_out, float * hidden_out, float * logits_out,
+                    bool fused, std::string * err);
+
     // Mark a token as previously generated (seeds the repetition-penalty
     // set with tokens sampled outside the fused path, e.g. frame 0 from
     // the prefill logits).
@@ -103,12 +113,23 @@ public:
     // predictor without a host round-trip).
     float * device_hidden() { return d_hidden_; }
 
+    // Device-side repetition-penalty seen set (vocab bytes). Shared with
+    // the fused-frame kernel so the penalty state survives across the
+    // fused/chained boundary; reset per request via reset_repetition().
+    uint8_t * device_seen();
+
     // Wall time of the last run() in microseconds (device-side, event timed).
     float last_run_us() const { return last_run_us_; }
 
     int grid_blocks() const { return grid_blocks_; }
 
 private:
+    bool run_impl(const float * step_embd, bool step_is_device, int32_t n_past, const tl_kv & kv,
+                 float temperature, int32_t top_k, float repetition_penalty,
+                 int32_t eos_id, uint64_t seed,
+                 int32_t * cb0_out, float * hidden_out, float * logits_out,
+                 bool fused, std::string * err);
+
     struct impl;
     impl * p_ = nullptr;
     int grid_blocks_ = 0;

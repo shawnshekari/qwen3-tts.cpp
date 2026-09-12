@@ -73,6 +73,28 @@ public:
              int32_t top_k, uint64_t seed, int32_t * codes_out, float * logits,
              bool fused, std::string * err);
 
+    // Device-resident variant: `d_hidden` is a DEVICE pointer to the
+    // talker's post-norm hidden (e.g. HipTalker::device_hidden()), so
+    // the 4 KB host->device copy is skipped and the kernel reads the
+    // talker's buffer in place. The caller must ensure the producing
+    // kernel has completed before this runs (the synchronous generate()
+    // loop guarantees it) and must not overwrite `d_hidden` until the
+    // returned codes have been read back.
+    bool run_device(const float * d_hidden, int32_t cb0_token, float temperature,
+                    int32_t top_k, uint64_t seed, int32_t * codes_out, float * logits,
+                    bool fused, std::string * err);
+
+    // Assemble the next talker step embedding on-device from the codes
+    // sampled by the last run()/run_device() plus `trailing_row` (host,
+    // f32 [hidden], this frame's trailing text row). Result is available
+    // via device_step_embd() for a chained HipTalker::run_device() call,
+    // removing the 16 embedding-row D2H + host adds from the critical
+    // path. Bit-identical to the host assembly (same summation order).
+    bool assemble_step_embd(const float * trailing_row, std::string * err);
+
+    // Device pointer to the last assembled step embedding.
+    float * device_step_embd();
+
     // Wall time of the last run() in microseconds (device-side, event timed).
     float last_run_us() const { return last_run_us_; }
 

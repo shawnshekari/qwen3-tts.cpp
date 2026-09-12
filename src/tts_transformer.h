@@ -49,6 +49,9 @@ struct tts_timing {
     // Embed lookups in generate() loop
     double t_embed_lookup_ms = 0;
 
+    // Single fused talker+cp frame kernel (device-side, event timed)
+    double t_fused_frame_ms = 0;
+
     int32_t n_frames = 0;
     double t_generate_total_ms = 0;
 };
@@ -297,10 +300,14 @@ public:
     // hidden: hidden states from talker [hidden_size]
     // codebook_0_token: the codebook 0 token (used to create 2-token prefill input)
     // output: generated codes for codebooks 1-15 [15]
-    bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token, 
-                                       std::vector<int32_t> & output,
-                                       float temperature = 0.9f,
-                                       int32_t top_k = 50);
+    // device_hidden: optional DEVICE pointer to the talker hidden (from
+    // HipTalker::device_hidden()); when set and the fused cp is active,
+    // the host copy of `hidden` is skipped (device-resident chaining).
+    bool predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
+                                        std::vector<int32_t> & output,
+                                        float temperature = 0.9f,
+                                        int32_t top_k = 50,
+                                        const float * device_hidden = nullptr);
     
     // Generate speech codes autoregressively
     // text_tokens: input text token IDs [n_tokens]
@@ -378,9 +385,10 @@ private:
     // sampling on device. Gated by QWEN3_TTS_USE_HIP_CODE_PRED=1.
     bool init_hip_code_pred();
     bool predict_codes_autoregressive_hip(const float * hidden, int32_t codebook_0_token,
-                                         std::vector<int32_t> & output,
-                                         float temperature,
-                                         int32_t top_k);
+                                          std::vector<int32_t> & output,
+                                          float temperature,
+                                          int32_t top_k,
+                                          const float * device_hidden = nullptr);
 #endif
 
     bool build_prefill_graph(const int32_t * text_tokens, int32_t n_tokens,
@@ -474,6 +482,21 @@ private:
     class HipTalker * hip_talker_ = nullptr;
     bool hip_talker_ready_ = false;
     bool hip_talker_failed_ = false;
+    // True when the most recent predict_codes_autoregressive() ran on the
+    // fused HIP cp (so its device d_codes buffer holds this frame's codes
+    // and the device-side step_embd assembly is valid).
+    bool cp_last_frame_fused_ = false;
+
+    // Single fused talker+cp frame kernel (docs/talker_fusion_handoff.md,
+    // "THE NEXT TASK"). One cooperative launch per frame produces the next
+    // frame's cb0 + 15 codes + next step_embd on-device, replacing the
+    // three-launch chained path. Gated by QWEN3_TTS_USE_HIP_FRAME_FUSION=1
+    // (requires the fused talker). On barrier timeout the frame falls back
+    // to the chained path (NOT ggml).
+    bool init_hip_frame();
+    class HipFrameFusion * hip_frame_ = nullptr;
+    bool hip_frame_ready_ = false;
+    bool hip_frame_failed_ = false;
 #endif
 
 #ifdef QWEN3_TTS_TIMING

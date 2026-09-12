@@ -15,6 +15,7 @@
 // row, 8 f16 per lane per iteration); the input vector is staged in LDS.
 
 #include "code_pred_hip.h"
+#include "hip/hip_dev.h"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -24,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+
+using namespace qwen3_tts::hipdev;
 
 namespace cg = cooperative_groups;
 
@@ -74,139 +77,10 @@ enum cp_phase : int {
 
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { if (err) *err = std::string(#x) + ": " + hipGetErrorString(e_); return false; } } while (0)
 
-__device__ __forceinline__ float warp_sum(float v) {
-    for (int o = warpSize / 2; o > 0; o >>= 1) v += __shfl_xor(v, o, warpSize);
-    return v;
-}
-
-// Block-wide sum; every thread gets the result. `red` is LDS scratch [32].
-__device__ __forceinline__ float block_sum(float v, float * red) {
-    const int lane = threadIdx.x % warpSize;
-    const int wid  = threadIdx.x / warpSize;
-    const int nw   = blockDim.x / warpSize;
-    v = warp_sum(v);
-    __syncthreads();
-    if (lane == 0) red[wid] = v;
-    __syncthreads();
-    v = (threadIdx.x < nw) ? red[threadIdx.x] : 0.0f;
-    if (wid == 0) v = warp_sum(v);
-    if (threadIdx.x == 0) red[0] = v;
-    __syncthreads();
-    return red[0];
-}
-
-// Deadline-aware grid barrier (sense-reversing). Returns false once any
-// block's wait exceeded spin_cap; every later barrier then short-circuits
-// so the whole grid unwinds instead of deadlocking. Caller must zero the
-// 3-word buffer before each cooperative launch.
-__device__ __forceinline__ bool grid_barrier(volatile unsigned * bar, unsigned nblocks,
-                                            unsigned long long spin_cap) {
-    __shared__ unsigned lsense;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        if (bar[2]) {
-            lsense = bar[1];
-        } else {
-            const unsigned s = bar[1];
-            __threadfence();
-            const unsigned prev = atomicAdd((unsigned *) &bar[0], 1u);
-            if (prev + 1u == nblocks) {
-                bar[0] = 0u;
-                __threadfence();
-                bar[1] = s ^ 1u;
-                lsense = s ^ 1u;
-            } else {
-                unsigned long long spins = 0;
-                while (bar[1] == s && !bar[2]) {
-                    if (++spins >= spin_cap) { bar[2] = 1u; break; }
-                }
-                lsense = bar[1];
-            }
-        }
-    }
-    __syncthreads();
-    __threadfence();
-    return bar[2] == 0u;
-}
-
-__device__ __forceinline__ float f32_from_bits(const uint16_t * p, int i) {
-    return reinterpret_cast<const float *>(p)[i];
-}
-
-// out[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i], x from global, out into LDS
-__device__ void block_rmsnorm(const float * x, const uint16_t * w_bits, int n, float eps,
-                              float * out, float * red) {
-    float ss = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
-    ss = block_sum(ss, red);
-    const float scale = rsqrtf(ss / n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = x[i] * scale * f32_from_bits(w_bits, i);
-    __syncthreads();
-}
-
-// Copy a global f32 vector into LDS.
-__device__ __forceinline__ void block_stage(const float * src, int n, float * dst) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
-    __syncthreads();
-}
-
-__device__ __forceinline__ float dot8(const uint4 & u, const float * xs) {
-    const __half2 * h2 = reinterpret_cast<const __half2 *>(&u);
-    const float2 f0 = __half22float2(h2[0]);
-    const float2 f1 = __half22float2(h2[1]);
-    const float2 f2 = __half22float2(h2[2]);
-    const float2 f3 = __half22float2(h2[3]);
-    return f0.x * xs[0] + f0.y * xs[1] + f1.x * xs[2] + f1.y * xs[3]
-         + f2.x * xs[4] + f2.y * xs[5] + f3.x * xs[6] + f3.y * xs[7];
-}
-
-// R rows of W (row-major f16) dotted with xs (f32, LDS) by one wave, reduced
-// into acc[0..R). The R rows' loads are issued together so R*(n_cols/256)
-// 16-byte loads are in flight per lane; one row at a time was latency-bound.
-// Rows past n_rows contribute zero. n_cols % 8 == 0.
-template <int R>
-__device__ __forceinline__ void wave_dot_rows(const uint16_t * W, int row0, int n_rows, int n_cols,
-                                              const float * xs, float * acc) {
-    const int lane = threadIdx.x % warpSize;
-    #pragma unroll
-    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-    #pragma unroll 2
-    for (int c = lane * 8; c < n_cols; c += warpSize * 8) {
-        uint4 u[R];
-        #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            u[r] = (row0 + r < n_rows)
-                 ? *reinterpret_cast<const uint4 *>(W + (size_t) (row0 + r) * n_cols + c)
-                 : make_uint4(0, 0, 0, 0);
-        }
-        #pragma unroll
-        for (int r = 0; r < R; ++r) acc[r] += dot8(u[r], xs + c);
-    }
-    #pragma unroll
-    for (int r = 0; r < R; ++r) acc[r] = warp_sum(acc[r]);
-}
-
-constexpr int MV_ROWS = 4;   // rows per wave per pass
-
-// y[row] (=, or += when accumulate) W*xs over all rows, partitioned across the grid's waves
-template <bool ACCUMULATE>
-__device__ void grid_matvec(const uint16_t * W, int n_rows, int n_cols, const float * xs, float * y) {
-    const int lane  = threadIdx.x % warpSize;
-    const int wpb   = blockDim.x / warpSize;
-    const int gwave = blockIdx.x * wpb + threadIdx.x / warpSize;
-    const int nwave = gridDim.x * wpb;
-    for (int row0 = gwave * MV_ROWS; row0 < n_rows; row0 += nwave * MV_ROWS) {
-        float acc[MV_ROWS];
-        wave_dot_rows<MV_ROWS>(W, row0, n_rows, n_cols, xs, acc);
-        if (lane < MV_ROWS && row0 + lane < n_rows) {
-            // lane r holds acc[r] after the full-wave reduce (all lanes hold every value)
-            float d = acc[0];
-            #pragma unroll
-            for (int r = 1; r < MV_ROWS; ++r) if (lane == r) d = acc[r];
-            if (ACCUMULATE) y[row0 + lane] += d; else y[row0 + lane] = d;
-        }
-    }
-}
+// warp_sum / block_sum / grid_barrier / block_rmsnorm / block_stage /
+// dot8 / wave_dot_rows / MV_ROWS / grid_matvec / pcg32_next /
+// block_argmax come from hip/hip_dev.h (shared with the fused talker and
+// the fused-frame kernel).
 
 __device__ void phase_embed(const cp_params & P, const cp_weights & W, const cp_work & B, int pos) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -353,43 +227,6 @@ __device__ void phase_head(const cp_params & P, const cp_weights & W, const cp_w
     grid_matvec<false>(W.lm_head[pos - 1], P.vocab, P.hidden, xs, B.logits + (size_t) (pos - 1) * P.vocab);
 }
 
-__device__ __forceinline__ uint32_t pcg32_next(uint64_t & s) {
-    const uint64_t old = s;
-    s = old * 6364136223846793005ull + 1442695040888963407ull;
-    const uint32_t xs = (uint32_t) (((old >> 18u) ^ old) >> 27u);
-    const uint32_t rot = (uint32_t) (old >> 59u);
-    return (xs >> rot) | (xs << ((0u - rot) & 31u));
-}
-
-// Block-wide argmax over n elements of a global f32 array; thread 0 gets the
-// index (lowest index wins ties). Scratch: red[0..] for values, red[16..]
-// for indices (block 256 threads = 8 warps, fits).
-__device__ int block_argmax(const float * v, int n, float * red) {
-    const int lane = threadIdx.x % warpSize;
-    const int wid  = threadIdx.x / warpSize;
-    const int nw   = blockDim.x / warpSize;
-    float bv = -INFINITY; int bi = 0;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const float x = v[i];
-        if (x > bv || (x == bv && i < bi)) { bv = x; bi = i; }
-    }
-    for (int o = warpSize / 2; o > 0; o >>= 1) {
-        const float ov = __shfl_xor(bv, o, warpSize);
-        const int oi = __shfl_xor(bi, o, warpSize);
-        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-    }
-    float * rv = red;
-    int * ri = (int *) (red + 16);
-    __syncthreads();
-    if (lane == 0) { rv[wid] = bv; ri[wid] = bi; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        for (int w = 1; w < nw; ++w)
-            if (rv[w] > rv[0] || (rv[w] == rv[0] && ri[w] < ri[0])) { rv[0] = rv[w]; ri[0] = ri[w]; }
-    }
-    __syncthreads();
-    return ri[0];
-}
 
 // One block (blockIdx.x == 0) samples head h = pos-1 and writes B.codes[pos].
 // Mirrors the host sample_or_argmax: greedy if temperature <= 0, else
@@ -541,9 +378,32 @@ struct HipCodePredictor::impl {
     cp_work B = {};
     float * d_hidden = nullptr;
     int32_t * d_codes = nullptr;
+    float * d_step_embd = nullptr;   // device-assembled next-frame step embedding
+    float * d_trailing = nullptr;    // staging for this frame's trailing text row
     hipEvent_t ev0 = nullptr, ev1 = nullptr;
     hipStream_t stream = nullptr;
 };
+
+// Assemble the next talker step embedding on-device:
+//   out[h] = codec_embd[cb0][h] + sum_{cb=0..14} cp_embd[cb][code_cb][h] + trailing[h]
+// Summation order matches the host generate() loop (codec row first, then the
+// 15 code-predictor rows, then the trailing row) so the F32 result is
+// bit-identical to the host path.
+__global__ void k_assemble_step_embd(cp_params P, cp_weights W,
+                                    const int32_t * codes, const float * trailing,
+                                    float * out) {
+    const int hidden = P.hidden;
+    for (int h = blockIdx.x * blockDim.x + threadIdx.x; h < hidden;
+         h += gridDim.x * blockDim.x) {
+        float v = __half2float(reinterpret_cast<const __half *>(W.talker_codec_embd)[(size_t)codes[0] * hidden + h]);
+        #pragma unroll
+        for (int cb = 0; cb < CP_N_HEADS_OUT; ++cb) {
+            v += __half2float(reinterpret_cast<const __half *>(W.codec_embd[cb])[(size_t)codes[1 + cb] * hidden + h]);
+        }
+        v += trailing[h];
+        out[h] = v;
+    }
+}
 
 HipCodePredictor::HipCodePredictor() = default;
 HipCodePredictor::~HipCodePredictor() { release(); }
@@ -570,6 +430,8 @@ bool HipCodePredictor::init(const cp_params & params, const cp_weights & weights
     CK(hipMalloc(&p_->B.logits, CP_N_HEADS_OUT * P.vocab * sizeof(float)));
     CK(hipMalloc(&p_->d_hidden, P.hidden * sizeof(float)));
     CK(hipMalloc(&p_->d_codes,  CP_MAX_POS * sizeof(int32_t)));
+    CK(hipMalloc(&p_->d_step_embd, P.hidden * sizeof(float)));
+    CK(hipMalloc(&p_->d_trailing,  P.hidden * sizeof(float)));
     p_->B.hidden_in = p_->d_hidden;
     p_->B.codes = p_->d_codes;
     CK(hipStreamCreateWithFlags(&p_->stream, hipStreamNonBlocking));
@@ -599,7 +461,7 @@ void HipCodePredictor::release() {
     if (!p_) return;
     void * bufs[] = { p_->B.x, p_->B.q, p_->B.k, p_->B.v, p_->B.kcache, p_->B.vcache,
                       p_->B.attn, p_->B.h, p_->B.logits, p_->d_hidden, p_->d_codes,
-                      (void *) p_->B.bar };
+                      p_->d_step_embd, p_->d_trailing, (void *) p_->B.bar };
     for (void * b : bufs) (void) hipFree(b);
     if (p_->ev0) (void) hipEventDestroy(p_->ev0);
     if (p_->ev1) (void) hipEventDestroy(p_->ev1);
@@ -616,6 +478,7 @@ bool HipCodePredictor::run(const float * hidden, int32_t cb0_token, float temper
     p_->B.temperature = temperature;
     p_->B.top_k = top_k;
     p_->B.seed = seed;
+    p_->B.hidden_in = p_->d_hidden;
     CK(hipMemcpyAsync(p_->d_hidden, hidden, P.hidden * sizeof(float), hipMemcpyHostToDevice, p_->stream));
     CK(hipMemcpyAsync(p_->d_codes, &cb0_token, sizeof(int32_t), hipMemcpyHostToDevice, p_->stream));
     CK(hipEventRecord(p_->ev0, p_->stream));
@@ -656,6 +519,76 @@ bool HipCodePredictor::run(const float * hidden, int32_t cb0_token, float temper
     if (codes_out) {
         CK(hipMemcpy(codes_out, p_->d_codes + 1, CP_N_HEADS_OUT * sizeof(int32_t), hipMemcpyDeviceToHost));
     }
+    return true;
+}
+
+bool HipCodePredictor::run_device(const float * d_hidden, int32_t cb0_token, float temperature,
+                                 int32_t top_k, uint64_t seed, int32_t * codes_out, float * logits,
+                                 bool fused, std::string * err) {
+    if (!p_) { if (err) *err = "not initialised"; return false; }
+    if (!d_hidden) { if (err) *err = "run_device: null device hidden pointer"; return false; }
+    const cp_params & P = p_->P;
+    p_->B.temperature = temperature;
+    p_->B.top_k = top_k;
+    p_->B.seed = seed;
+    // Read the talker's hidden straight off the device — no host round-trip.
+    p_->B.hidden_in = d_hidden;
+    CK(hipMemcpyAsync(p_->d_codes, &cb0_token, sizeof(int32_t), hipMemcpyHostToDevice, p_->stream));
+    CK(hipEventRecord(p_->ev0, p_->stream));
+    const int n_pos = CP_MAX_POS;
+    if (fused) {
+        CK(hipMemsetAsync((void *) p_->B.bar, 0, 3 * sizeof(unsigned), p_->stream));
+        void * args[] = { (void *) &p_->P, (void *) &p_->W, (void *) &p_->B, (void *) &n_pos };
+        CK(hipLaunchCooperativeKernel((const void *) k_fused, dim3(grid_blocks_), dim3(BLOCK), args, 0, p_->stream));
+    } else {
+        for (int pos = 0; pos < n_pos; ++pos) {
+            k_phase<<<grid_blocks_, BLOCK, 0, p_->stream>>>(PH_EMBED, p_->P, p_->W, p_->B, 0, pos);
+            for (int il = 0; il < P.n_layer; ++il) {
+                for (int ph = PH_QKV; ph <= PH_DOWN; ++ph) {
+                    k_phase<<<grid_blocks_, BLOCK, 0, p_->stream>>>(ph, p_->P, p_->W, p_->B, il, pos);
+                }
+            }
+            k_phase<<<grid_blocks_, BLOCK, 0, p_->stream>>>(PH_HEAD, p_->P, p_->W, p_->B, 0, pos);
+            k_phase<<<grid_blocks_, BLOCK, 0, p_->stream>>>(PH_SAMPLE, p_->P, p_->W, p_->B, 0, pos);
+        }
+    }
+    CK(hipEventRecord(p_->ev1, p_->stream));
+    if (logits) {
+        CK(hipMemcpyAsync(logits, p_->B.logits, CP_N_HEADS_OUT * P.vocab * sizeof(float), hipMemcpyDeviceToHost, p_->stream));
+    }
+    CK(hipStreamSynchronize(p_->stream));
+    CK(hipGetLastError());
+    if (fused) {
+        unsigned hbar[3] = {0, 0, 0};
+        CK(hipMemcpy(hbar, (const void *) p_->B.bar, sizeof(hbar), hipMemcpyDeviceToHost));
+        if (hbar[2]) {
+            if (err) *err = "grid barrier timed out (aborted): the cooperative grid could not run to completion; retry with fewer blocks per CU";
+            return false;
+        }
+    }
+    float ms = 0;
+    CK(hipEventElapsedTime(&ms, p_->ev0, p_->ev1));
+    last_run_us_ = ms * 1000.0f;
+    if (codes_out) {
+        CK(hipMemcpy(codes_out, p_->d_codes + 1, CP_N_HEADS_OUT * sizeof(int32_t), hipMemcpyDeviceToHost));
+    }
+    return true;
+}
+
+float * HipCodePredictor::device_step_embd() { return p_ ? p_->d_step_embd : nullptr; }
+
+bool HipCodePredictor::assemble_step_embd(const float * trailing_row, std::string * err) {
+    if (!p_) { if (err) *err = "not initialised"; return false; }
+    if (!trailing_row) { if (err) *err = "assemble: null trailing row"; return false; }
+    const cp_params & P = p_->P;
+    // Stage this frame's trailing text row, then fold it with the codes
+    // (already on device from the last run()) and the embedding tables.
+    CK(hipMemcpyAsync(p_->d_trailing, trailing_row, P.hidden * sizeof(float),
+                      hipMemcpyHostToDevice, p_->stream));
+    k_assemble_step_embd<<<4, 256, 0, p_->stream>>>(p_->P, p_->W, p_->d_codes,
+                                                   p_->d_trailing, p_->d_step_embd);
+    CK(hipGetLastError());
+    CK(hipStreamSynchronize(p_->stream));
     return true;
 }
 

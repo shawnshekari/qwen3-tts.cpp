@@ -285,6 +285,35 @@ if(GGML_HIP)
 
     add_executable(test_hip_talker tests/test_hip_talker.cpp)
     target_link_libraries(test_hip_talker PRIVATE talker_hip ggml hip::host)
+
+    # Gate 1 (talker_fusion_handoff.md): mid-generation fallback when a
+    # second process saturates the GPU and the cooperative grid times out.
+    add_executable(test_hip_talker_fallback
+        tests/test_hip_talker_fallback.cpp
+        tests/gpu_saturate.hip
+    )
+    set_source_files_properties(tests/gpu_saturate.hip PROPERTIES LANGUAGE HIP)
+    target_include_directories(test_hip_talker_fallback PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(test_hip_talker_fallback PRIVATE tts_transformer ggml hip::host)
+
+    # Single fused talker+cp frame kernel (docs/talker_fusion_handoff.md,
+    # "THE NEXT TASK"): one cooperative launch per frame produces cb0 +
+    # the 15 codes + the next step_embd on-device.
+    add_library(frame_fused STATIC src/hip/frame_fused.hip)
+    set_source_files_properties(src/hip/frame_fused.hip PROPERTIES LANGUAGE HIP)
+    target_include_directories(frame_fused PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(frame_fused PUBLIC hip::host)
+
+    target_link_libraries(tts_transformer PUBLIC frame_fused)
+
+    add_executable(test_hip_frame_fused tests/test_hip_frame_fused.cpp)
+    target_link_libraries(test_hip_frame_fused PRIVATE frame_fused talker_hip code_pred_hip ggml hip::host)
+
+    # Fused-frame fallback: a mid-generation fused-frame failure (barrier
+    # timeout on a busy GPU, simulated by the run_frame test hook) makes
+    # generate() fall back to the chained path (NOT ggml).
+    add_executable(test_hip_frame_fallback tests/test_hip_frame_fallback.cpp)
+    target_link_libraries(test_hip_frame_fallback PRIVATE tts_transformer ggml hip::host)
 endif()
 
 # Streaming-vs-oneshot parity test for the audio decoder

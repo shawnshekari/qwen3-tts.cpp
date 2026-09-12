@@ -5,6 +5,9 @@
 #ifdef QWEN3_TTS_HIP
 #include "hip/code_pred_hip.h"
 #include "hip/talker_hip.h"
+#ifdef QWEN3_TTS_HIP
+#include "hip/frame_fused.h"
+#endif
 #include <hip/hip_runtime.h>
 #endif
 
@@ -2738,6 +2741,14 @@ bool TTSTransformer::predict_codes_autoregressive_coreml(const float * hidden,
 }
 
 #ifdef QWEN3_TTS_HIP
+// Stashed params/weights from the fused talker and cp inits, reused by
+// init_hip_frame() so the fused-frame kernel shares the exact same weight
+// pointers (talker in-place, cp uploaded) rather than re-deriving them.
+static tl_params s_tl_params;
+static tl_weights s_tl_weights;
+static cp_params s_cp_params;
+static cp_weights s_cp_weights;
+
 bool TTSTransformer::init_hip_code_pred() {
     hip_code_pred_failed_ = true;
     const auto & cfg = model_.config;
@@ -2799,6 +2810,8 @@ bool TTSTransformer::init_hip_code_pred() {
         if (!to_dev(model_.code_pred_head[i], GGML_TYPE_F16, &W.lm_head[i]))    return false;
     }
 
+    s_cp_params = P;
+    s_cp_weights = W;
     hip_code_pred_ = new HipCodePredictor();
     std::string err;
     if (!hip_code_pred_->init(P, W, &err)) {
@@ -2816,19 +2829,27 @@ bool TTSTransformer::init_hip_code_pred() {
 
 bool TTSTransformer::predict_codes_autoregressive_hip(const float * hidden, int32_t codebook_0_token,
                                                      std::vector<int32_t> & output,
-                                                     float temperature, int32_t top_k) {
+                                                     float temperature, int32_t top_k,
+                                                     const float * device_hidden) {
     if (!hip_code_pred_ready_) { error_msg_ = "HIP fused code predictor not ready"; return false; }
     std::vector<int32_t> codes(CP_N_HEADS_OUT);
     std::uniform_int_distribution<uint64_t> dist(1, ~0ull);
     const uint64_t seed = dist(rng_);
     std::string err;
     // No logits readback: the pipeline only consumes the 60-byte codes.
-    if (!hip_code_pred_->run(hidden, codebook_0_token, temperature, top_k, seed,
-                            codes.data(), nullptr, /*fused=*/true, &err)) {
+    // When a device hidden pointer is supplied (fused-talker chaining),
+    // read it in place instead of copying the host hidden across PCIe.
+    const bool ok = device_hidden
+        ? hip_code_pred_->run_device(device_hidden, codebook_0_token, temperature, top_k, seed,
+                                    codes.data(), nullptr, /*fused=*/true, &err)
+        : hip_code_pred_->run(hidden, codebook_0_token, temperature, top_k, seed,
+                             codes.data(), nullptr, /*fused=*/true, &err);
+    if (!ok) {
         error_msg_ = "HIP fused code predictor: " + err;
         return false;
     }
     output.assign(codes.begin(), codes.end());
+    cp_last_frame_fused_ = true;
     return true;
 }
 
@@ -2883,6 +2904,8 @@ bool TTSTransformer::init_hip_talker() {
     if (!dev_ptr(model_.output_norm, GGML_TYPE_F32, &W.output_norm)) return false;
     if (!dev_ptr(model_.codec_head,  GGML_TYPE_F16, &W.codec_head))  return false;
 
+    s_tl_params = P;
+    s_tl_weights = W;
     hip_talker_ = new HipTalker();
     std::string err;
     if (!hip_talker_->init(P, W, &err)) {
@@ -2897,15 +2920,41 @@ bool TTSTransformer::init_hip_talker() {
             hip_talker_->grid_blocks(), P.n_layer, P.vocab);
     return true;
 }
+
+bool TTSTransformer::init_hip_frame() {
+    // Requires the fused talker (for the shared seen set) and the fused cp
+    // (for the uploaded cp weight pointers). Both must already be inited.
+    if (!hip_talker_ready_ || !hip_code_pred_ready_) {
+        error_msg_ = "HIP frame fusion requires the fused talker and cp";
+        return false;
+    }
+    hip_frame_ = new HipFrameFusion();
+    std::string err;
+    if (!hip_frame_->init(s_tl_params, s_tl_weights, s_cp_params, s_cp_weights,
+                         hip_talker_->device_seen(), &err)) {
+        error_msg_ = "HIP frame fusion init: " + err;
+        delete hip_frame_;
+        hip_frame_ = nullptr;
+        return false;
+    }
+    hip_frame_failed_ = false;
+    hip_frame_ready_ = true;
+    fprintf(stderr, "  HIP fused frame: %d blocks (%d/CU), talker %d layers + cp %d layers\n",
+            hip_frame_->grid_blocks(), hip_frame_->occupancy_per_cu(),
+            s_tl_params.n_layer, s_cp_params.n_layer);
+    return true;
+}
 #endif // QWEN3_TTS_HIP
 
 bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
                                                    std::vector<int32_t> & output,
-                                                   float temperature, int32_t top_k) {
+                                                   float temperature, int32_t top_k,
+                                                   const float * device_hidden) {
     if (!model_.ctx) {
         error_msg_ = "Model not loaded";
         return false;
     }
+    cp_last_frame_fused_ = false;  // set true only if the fused HIP cp runs
     
     const auto & cfg = model_.config;
 
@@ -2931,7 +2980,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     if (use_hip_code_pred && !hip_code_pred_failed_) {
         if (!hip_code_pred_ready_ && !init_hip_code_pred()) {
             fprintf(stderr, "  HIP fused code predictor unavailable, using GGML: %s\n", error_msg_.c_str());
-        } else if (predict_codes_autoregressive_hip(hidden, codebook_0_token, output, temperature, top_k)) {
+        } else if (predict_codes_autoregressive_hip(hidden, codebook_0_token, output, temperature, top_k, device_hidden)) {
             return true;
         } else {
             fprintf(stderr, "  HIP fused code predictor failed, falling back to GGML: %s\n", error_msg_.c_str());
@@ -3508,6 +3557,38 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     double t_loop_total_ms = 0, t_host_tail_ms = 0;
 #endif
 
+    // Device-resident chaining: true when the hidden the cp is about to
+    // consume lives in the fused talker's device buffer (i.e. the
+    // previous frame's talker ran fused), so the cp reads it in place
+    // instead of a host copy. Frame 0's hidden comes from the ggml
+    // prefill on the host, so it starts false.
+    bool prev_hidden_device = false;
+
+#ifdef QWEN3_TTS_HIP
+    // Single fused talker+cp frame (docs/talker_fusion_handoff.md, "THE
+    // NEXT TASK"). When active, one cooperative launch at the end of each
+    // frame produces the NEXT frame's cb0 + 15 codes + next step_embd
+    // on-device, so the next iteration skips the cp launch and the
+    // assemble+talker chained tail entirely.
+    static const bool use_frame_fusion =
+        std::getenv("QWEN3_TTS_USE_HIP_FRAME_FUSION") != nullptr;
+    bool fused_frame_active = false;
+    std::vector<int32_t> fused_next_codes(CP_N_HEADS_OUT, 0);
+    if (use_frame_fusion && fused_talker && !hip_frame_failed_) {
+        // The fused cp is normally lazily inited inside
+        // predict_codes_autoregressive; frame fusion needs its uploaded
+        // weight pointers up front, so force it here.
+        if (!hip_code_pred_ready_ && !init_hip_code_pred()) {
+            fprintf(stderr, "  HIP fused frame unavailable (cp init failed), using chained path: %s\n",
+                    error_msg_.c_str());
+            hip_frame_failed_ = true;
+        } else if (!hip_frame_ready_ && !init_hip_frame()) {
+            fprintf(stderr, "  HIP fused frame unavailable, using chained path: %s\n", error_msg_.c_str());
+            hip_frame_failed_ = true;
+        }
+    }
+#endif
+
     for (int frame = 0; frame < max_len; ++frame) {
 #ifdef QWEN3_TTS_TIMING
         auto t_loop_start = clk::now();
@@ -3558,9 +3639,24 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         t0 = clk::now();
 #endif
         std::vector<int32_t> codes_1_15;
-        if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15, temperature, top_k)) {
+#ifdef QWEN3_TTS_HIP
+        if (fused_frame_active) {
+            // The codes were produced on-device by the last fused-frame
+            // launch (talker step + cp loop in one kernel); no cp launch
+            // needed here. Bit-identical to the chained cp.
+            codes_1_15 = fused_next_codes;
+            cp_last_frame_fused_ = true;
+        } else {
+            const float * cp_device_hidden = prev_hidden_device ? hip_talker_->device_hidden() : nullptr;
+            if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15, temperature, top_k, cp_device_hidden)) {
+                return false;
+            }
+        }
+#else
+        if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15, temperature, top_k, nullptr)) {
             return false;
         }
+#endif
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         timing.t_code_pred_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3590,25 +3686,130 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             break;
         }
 
-        std::fill(step_embd.begin(), step_embd.end(), 0.0f);
+        const float * trailing_row = (frame < trailing_len)
+            ? trailing_text_hidden.data() + (size_t)frame * cfg.hidden_size
+            : tts_pad_embed.data();
+
+#ifdef QWEN3_TTS_HIP
+        // ---- single fused talker+cp frame (docs/talker_fusion_handoff.md,
+        // "THE NEXT TASK") ----
+        // One cooperative launch produces the NEXT frame's cb0 + 15 codes +
+        // next step_embd on-device, replacing the three-launch chained path
+        // (assemble + talker.run_device + the next frame's cp launch). The
+        // talker and cp barrier schedules share one deadline-aware
+        // grid_barrier; a barrier timeout falls back to the chained path
+        // (NOT ggml), so the win degrades gracefully.
+        bool fused_frame_ran = false;
+        if (use_frame_fusion && fused_talker && !hip_frame_failed_) {
+            const float * step_in = nullptr;
+            if (fused_frame_active) {
+                step_in = hip_frame_->device_step_embd();
+            } else if (cp_last_frame_fused_) {
+                // Bootstrap: put this frame's step embedding on-device so
+                // the fused kernel can consume it (same assemble the
+                // chained path would do).
+                std::string aerr;
+                if (!hip_code_pred_->assemble_step_embd(trailing_row, &aerr)) {
+                    error_msg_ = "HIP step_embd assemble: " + aerr;
+                    return false;
+                }
+                step_in = hip_code_pred_->device_step_embd();
+            }
+            if (step_in) {
+                const float * trailing_next = (frame + 1 < trailing_len)
+                    ? trailing_text_hidden.data() + (size_t)(frame + 1) * cfg.hidden_size
+                    : tts_pad_embed.data();
+                tl_kv kv = {};
+                for (int il = 0; il < cfg.n_layers; ++il) {
+                    kv.k[il] = (const uint16_t *) state_.cache.k_cache[il]->data;
+                    kv.v[il] = (const uint16_t *) state_.cache.v_cache[il]->data;
+                }
+                // Draw the talker seed then the cp seed, matching the
+                // chained path's rng order (talker at end of frame N, cp
+                // at start of frame N+1) so the whole stream stays aligned.
+                std::uniform_int_distribution<uint64_t> fdist(1, ~0ull);
+                const uint64_t f_tseed = fdist(rng_);
+                const uint64_t f_cpseed = fdist(rng_);
+                std::string ferr;
+                if (hip_frame_->run_frame(step_in, n_past, kv, trailing_next,
+                                        temperature, top_k, repetition_penalty,
+                                        cfg.codec_eos_id, f_tseed, f_cpseed, &ferr)) {
+                    std::vector<int32_t> f16(CP_MAX_POS, 0);
+                    if (!hip_frame_->get_codes(f16.data(), &ferr)) {
+                        error_msg_ = "HIP fused frame readback: " + ferr;
+                        return false;
+                    }
+                    pending_cb0 = f16[0];
+                    fused_next_codes.assign(f16.begin() + 1, f16.end());
+                    fused_frame_active = true;
+                    fused_frame_ran = true;
+                    prev_hidden_device = true;
+#ifdef QWEN3_TTS_TIMING
+                    timing.t_fused_frame_ms += hip_frame_->last_run_us() * 1e-3;
+#endif
+                } else {
+                    // Fused-frame barrier timeout: fall back to the
+                    // three-launch CHAINED path for this frame (the
+                    // existing tail below redoes the assemble + talker
+                    // step, and the next frame runs the cp normally).
+                    // The aborted fused talker may have marked cb0 in the
+                    // shared seen set before aborting; re-sync from the
+                    // host's token record (mirror of Gate 1).
+                    fprintf(stderr, "  HIP fused frame failed, falling back to chained path: %s\n",
+                            ferr.c_str());
+                    hip_frame_failed_ = true;
+                    fused_frame_active = false;
+                    hip_talker_->reset_repetition();
+                    for (int32_t tok : generated_cb0_tokens) {
+                        if (!hip_talker_->mark_seen(tok, &ferr)) break;
+                    }
+                }
+            }
+        }
+        if (!fused_frame_ran) {
+#endif
+
+        // Device-resident chaining: when this frame's codes came from the
+        // fused cp and the fused talker will consume them, assemble the
+        // step embedding on-device (one kernel) instead of 16 embedding
+        // D2H reads + host adds.
+#ifdef QWEN3_TTS_HIP
+        const bool chain_embed = fused_talker && cp_last_frame_fused_;
+#else
+        const bool chain_embed = false;
+#endif
 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!lookup_single_embedding_row(model_.codec_embd, frame_codes[0], embd_row.data())) {
-            return false;
-        }
-        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-            step_embd[h] = embd_row[h];
-        }
-
-        for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
-            int32_t code_token = frame_codes[cb];
-            if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code_token, embd_row.data())) {
+#ifdef QWEN3_TTS_HIP
+        if (chain_embed) {
+            std::string aerr;
+            if (!hip_code_pred_->assemble_step_embd(trailing_row, &aerr)) {
+                error_msg_ = "HIP step_embd assemble: " + aerr;
+                return false;
+            }
+        } else
+#endif
+        {
+            std::fill(step_embd.begin(), step_embd.end(), 0.0f);
+            if (!lookup_single_embedding_row(model_.codec_embd, frame_codes[0], embd_row.data())) {
                 return false;
             }
             for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-                step_embd[h] += embd_row[h];
+                step_embd[h] = embd_row[h];
+            }
+            for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
+                int32_t code_token = frame_codes[cb];
+                if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code_token, embd_row.data())) {
+                    return false;
+                }
+                for (int32_t h = 0; h < cfg.hidden_size; ++h) {
+                    step_embd[h] += embd_row[h];
+                }
+            }
+            for (int32_t h = 0; h < cfg.hidden_size; ++h) {
+                step_embd[h] += trailing_row[h];
             }
         }
 #ifdef QWEN3_TTS_TIMING
@@ -3616,18 +3817,12 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         timing.t_embed_lookup_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
 
-        const float * trailing_row = (frame < trailing_len)
-            ? trailing_text_hidden.data() + (size_t)frame * cfg.hidden_size
-            : tts_pad_embed.data();
-        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-            step_embd[h] += trailing_row[h];
-        }
-
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
         t_host_tail_ms += std::chrono::duration<double, std::milli>(t0 - t_after_cp).count();
 #endif
 #ifdef QWEN3_TTS_HIP
+        bool fused_step_ok = false;
         if (fused_talker) {
             // The fused kernel reads/writes the same F16 KV cache the ggml
             // prefill filled; position stride = head_dim*n_kv_head matches
@@ -3640,14 +3835,53 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             std::uniform_int_distribution<uint64_t> tdist(1, ~0ull);
             const uint64_t tseed = tdist(rng_);
             std::string terr;
-            if (!hip_talker_->run(step_embd.data(), n_past, kv, temperature, top_k,
-                                 repetition_penalty, cfg.codec_eos_id, tseed,
-                                 &pending_cb0, last_hidden_.data(), nullptr,
-                                 /*fused=*/true, &terr)) {
-                error_msg_ = "HIP fused talker: " + terr;
-                return false;
+            // Skip the 4 KB hidden D2H when chaining into the fused cp —
+            // the cp reads the talker's device buffer in place. Keep the
+            // copy only when the logits diagnostic wants the host hidden.
+            static const bool want_host_hidden =
+                std::getenv("QWEN3_TTS_DUMP_LOGITS") != nullptr;
+            // When chaining, the step embedding is already on-device (just
+            // assembled by the cp); feed it straight in via a D2D copy.
+            const bool ran = chain_embed
+                ? hip_talker_->run_device(hip_code_pred_->device_step_embd(), n_past, kv,
+                                         temperature, top_k, repetition_penalty, cfg.codec_eos_id,
+                                         tseed, &pending_cb0,
+                                         want_host_hidden ? last_hidden_.data() : nullptr,
+                                         nullptr, /*fused=*/true, &terr)
+                : hip_talker_->run(step_embd.data(), n_past, kv,
+                                  temperature, top_k, repetition_penalty, cfg.codec_eos_id,
+                                  tseed, &pending_cb0,
+                                  want_host_hidden ? last_hidden_.data() : nullptr,
+                                  nullptr, /*fused=*/true, &terr);
+            if (ran) {
+                fused_step_ok = true;
+                prev_hidden_device = true;
+            } else {
+                // Gate 1 (talker_fusion_handoff.md): the cooperative grid
+                // could not run to completion on a busy GPU. Latch the
+                // fused path off for the rest of the process and redo this
+                // frame on the ggml talker + host sampling instead of
+                // failing the request. Any partial K/V the aborted kernel
+                // wrote at position n_past is overwritten by forward_step.
+                fprintf(stderr, "  HIP fused talker failed, falling back to GGML talker: %s\n",
+                        terr.c_str());
+                hip_talker_failed_ = true;
+                fused_talker = false;
+                prev_hidden_device = false;  // forward_step fills host hidden
+                // Re-sync the device seen[] set from the host's token
+                // record so the repetition penalty stays consistent if
+                // the fused path is ever resumed across the boundary.
+                hip_talker_->reset_repetition();
+                for (int32_t tok : generated_cb0_tokens) {
+                    if (!hip_talker_->mark_seen(tok, &terr)) {
+                        fprintf(stderr, "  HIP fused talker seen re-sync failed: %s\n",
+                                terr.c_str());
+                        break;
+                    }
+                }
             }
-        } else
+        }
+        if (!fused_step_ok)
 #endif
         if (!forward_step(step_embd.data(), n_past, logits)) {
             return false;
@@ -3655,6 +3889,9 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         timing.t_talker_forward_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
+#ifdef QWEN3_TTS_HIP
+        }  // if (!fused_frame_ran)
 #endif
 
         n_past++;
@@ -3699,6 +3936,9 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     fprintf(stderr, "      Data I/O:       %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_data_ms, nf > 0 ? t.t_code_pred_data_ms / nf : 0.0);
     fprintf(stderr, "      CoreML total:   %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_coreml_ms, nf > 0 ? t.t_code_pred_coreml_ms / nf : 0.0);
     fprintf(stderr, "\n  Embed lookups:      %8.1f ms   (%.1f ms/frame)\n", t.t_embed_lookup_ms, nf > 0 ? t.t_embed_lookup_ms / nf : 0.0);
+    if (t.t_fused_frame_ms > 0.0) {
+        fprintf(stderr, "  Fused frame (dev):  %8.1f ms   (%.1f ms/frame)\n", t.t_fused_frame_ms, nf > 0 ? t.t_fused_frame_ms / nf : 0.0);
+    }
     double accounted = t.t_prefill_build_ms + t.t_prefill_forward_ms + t.t_talker_forward_ms + t.t_code_pred_ms + t.t_embed_lookup_ms;
     fprintf(stderr, "  Other/overhead:     %8.1f ms\n", t.t_generate_total_ms - accounted);
     fprintf(stderr, "    [loop wall: %.1f ms; host tail (cp->talker): %.1f ms = %.2f ms/frame]\n",

@@ -1,24 +1,39 @@
 # Talker Fusion — Session Handoff
 
-Start here if you're picking up the fused HIP talker. Written 2026-09-12
-after the Phase 3 implementation (see `code_predictor_plan.md` Phase 3
-for the kernel design and parity numbers). This doc covers the **ship
-decision** and the **next step**, not the kernel internals.
+Start here if you're picking up the fused HIP talker. Written 2026-09-12.
+See `code_predictor_plan.md` Phases 2-3 for the kernel design and parity
+numbers. This doc covers the **ship state** and the **next step**, not
+the kernel internals.
 
-## Current state (what's done, what's live)
+## Current state (what's live in production)
 
-- Fused talker kernel: `src/hip/talker_hip.{h,hip}`, built and parity-
-  verified (hidden 0.018%, logits 0.05%, cb0 argmax match vs the
-  `QWEN3_TTS_DUMP_TALKER` reference). Talker stage 3.9 -> 2.4 ms/frame
-  in-context; ~19% faster end-to-end on a ~190-frame greedy request.
-- Integrated in `TTSTransformer::generate()` behind
-  `QWEN3_TTS_USE_HIP_TALKER=1`. **Off by default.**
-- **NOT in production.** `tts-engine.service` runs the toolbox-built
-  `build-hip/qwen3-tts-server` (Sep 10, before the talker work) with
-  only `QWEN3_TTS_USE_HIP_CODE_PRED=1`. The talker there is the plain
-  ggml HIP backend.
-- Built on the **host** with therock ROCm in `build-hip-host/` (see
-  "Build" below). The toolbox `build-hip/` does NOT have the talker yet.
+**All three gates passed and shipped.** `tts-engine.service` now runs the
+**host** binary `build-hip-host/qwen3-tts-server` with BOTH
+`QWEN3_TTS_USE_HIP_TALKER=1` and `QWEN3_TTS_USE_HIP_CODE_PRED=1`
+(fused talker + fused code predictor + vocoder, all on ROCm0), client
+seed pinned to 2. Live steady-state under llama-server contention:
+fused talker 2.2 ms/frame + fused cp 6.6 ms/frame + host tail 0.03
+ms/frame, RTF ~0.14, zero fallbacks.
+
+- Fused talker kernel: `src/hip/talker_hip.{h,hip}`, parity-verified
+  (hidden 0.018%, logits 0.05%, cb0 argmax match vs the
+  `QWEN3_TTS_DUMP_TALKER` reference).
+- Fused cp kernel: `src/hip/code_pred_hip.{h,hip}`, 15/15 argmax parity.
+- Gate 1 (mid-gen fallback), Gate 2 (seed 2 keeper), Gate 3 (host-binary
+  cutover) — all DONE, details in the gate sections below.
+- Device-resident chaining (hidden + step_embd) DONE & DEPLOYED — see
+  "Next technical lever" for what it set up.
+- The toolbox `build-hip/` is no longer used by the service (kept for
+  reference). The host `build-hip-host/` is the production build.
+
+## Next session: single fused talker+cp kernel
+
+The remaining big lever is **one cooperative launch per frame** that
+produces cb0 + all 15 codes + the next step_embd on-device, removing
+the last host round-trips and the cp's separate launch. All the
+prerequisite plumbing is already in place and deployed (see the chaining
+notes at the bottom of this doc). Full design notes and the kickoff
+prompt are in **"Next technical lever"** near the end of this file.
 
 ## Do NOT just flip the env var in the service. Three gates first.
 
@@ -47,6 +62,21 @@ or retry per frame. Recommend latch-and-fallback.
 Add a test: run the fused talker while a second process saturates the
 GPU and confirm the request completes via fallback rather than erroring.
 
+**DONE (2026-09-12).** Latch-and-fallback implemented in `generate()`:
+on `run()` failure the frame is redone with `forward_step` (which also
+overwrites any partial K/V the aborted kernel wrote at `n_past`),
+`hip_talker_failed_` latches for the process, and the device `seen[]`
+set is re-synced from `generated_cb0_tokens`. Test:
+`test_hip_talker_fallback` (forks a full-grid spin hog from
+`tests/gpu_saturate.hip`, runs two requests with stderr captured).
+Note: the GPU time-slices between processes, so with the default ~0.5 s
+barrier cap the 2.4 ms cooperative step still completes under a hog —
+the test sets `QWEN3_TTS_HIP_BARRIER_SPINS=1` to make the residency
+failure deterministic. Pass criteria: both requests complete, exactly
+one fallback line (latch held), fused init line present. Verified on
+the live box with llama-server + embedding-server resident; fused
+success path (CLI, default cap) and `test_hip_talker` parity unchanged.
+
 ### Gate 2 — seed re-audition (voice identity)
 
 The fused talker changes the arithmetic order, so sampled codes diverge
@@ -57,6 +87,20 @@ Before pinning: run 3-4 seeds through the **fused talker + fused cp**
 path on the reference voice(s) (`~/tools/reference_voices/nyx_reference.wav`),
 listen, pick the keeper, pin it. Same procedure as the Phase 2 re-audition.
 Do this AFTER gate 1 so you audition the shippable code.
+
+**DONE (2026-09-12). Keeper: seed 2.** Four seeds (1-4) through the
+Gate-1 build, fused talker + fused cp, temp 0.9 / top-k 50, both voices
+(nyx + amy mirrors); candidates in `/tmp/gate2_audition/`. User picked
+**seed 2** on nyx.
+
+**Pin coupling — apply at the Gate 3 cutover, not before.** The seed is
+path-dependent: seed 2 is only auditioned against the fused-talker
+arithmetic. The live client pin is `~/src/TTS-Player/tts_config.yaml`
+(`voices.seeds`, hot-reloaded; voice_1=nyx, voice_2=amy, currently 42
+= the ggml-talker roll). Changing it now would re-roll the live voice
+onto an unauditioned seed on the *old* path. At cutover, change both
+entries to `2` in the same window as adding
+`QWEN3_TTS_USE_HIP_TALKER=1` to the service.
 
 ### Gate 3 — build path
 
@@ -73,13 +117,52 @@ toolbox. Two options:
   container/kill-mode assumptions (the current unit shares the toolbox
   with llama-server via `KillMode=process`). Decide deliberately.
 
+**DONE (2026-09-12). Host binary cutover, live in production.**
+Decision drivers: the host build is a strict superset (links libav →
+mp3/opus works, which the old toolbox binary never had; current code
+with Gate 1), and a direct A/B of the fused cp on the same reference
+frame showed toolchain parity (host 5.63/5.70 ms vs toolbox 5.67/5.70
+ms best/mean, 15/15 argmax). Unit rewritten: `ExecStart` →
+`build-hip-host/qwen3-tts-server` directly, toolbox/podman/`KillMode=
+process`/pkill lines dropped, `Before=llama-server` VRAM ordering kept,
+fused flags via `Environment=`. **Gotcha hit during cutover:** systemd
+doesn't source `~/.bashrc`, so the therock libs weren't on the path —
+the unit now sets `LD_LIBRARY_PATH=/home/sreed/tools/therock-tarball/
+install/lib:.../llvm/lib` explicitly (the ld cache only has the old
+system `libamdhip64.so.5`). Client seed pins flipped 42→2 with the
+restart (Gate 2 keeper).
+
+**Voice trio self-heals:** the engine does NOT persist ICL voices across
+restarts — `tts-queue`'s `ensure_voices` re-registers voice_1=nyx /
+voice_2=amy on its next request cycle. A speech request that races the
+fresh engine gets a 400 `unknown voice`; restart order that avoids the
+race is engine → wait for queue to re-register → traffic. (The
+`tts-register-voices` oneshot adds duplicate ids voice_3/voice_4 —
+harmless.)
+
+**Steady state under live llama-server load:** fused talker 2.2 ms/frame
++ fused cp 6.6 ms/frame, zero fallbacks. Caveat worth watching: the
+very first request after the cutover *did* hit a fused-cp barrier
+timeout (my gate tests + register-voices speaker encoding were
+saturating the GPU in that window) and latched the cp to the GGML path
+at ~128 ms/frame under contention — the fallback keeps requests correct
+but latency collapses if it latches. If production latency ever
+degrades, check the journal for `HIP fused code predictor failed,
+falling back` and restart the engine on a quieter GPU. Rollback: remove
+the two `Environment=` fused flags (or restore
+`/tmp/tts-engine.service.bak`) + daemon-reload + restart, and restore
+seed pins to 42.
+
 ## Enabling, once gates pass
 
 Add `QWEN3_TTS_USE_HIP_TALKER=1` to the service ExecStart env (next to
-`QWEN3_TTS_USE_HIP_CODE_PRED=1`), `systemctl --user daemon-reload &&
-restart tts-engine`, and watch the journal for the
-`HIP fused talker: N blocks` line and any `grid barrier timed out`
-aborts under real load. Roll back by removing the env var.
+`QWEN3_TTS_USE_HIP_CODE_PRED=1`), flip the client seed pin
+(`tts_config.yaml` `voices.seeds`: voice_1/voice_2 `42` -> `2`, the
+Gate-2 fused-path keeper — see gate 2 note on why these move together),
+`systemctl --user daemon-reload && restart tts-engine`, and watch the
+journal for the `HIP fused talker: N blocks` line and any
+`grid barrier timed out` aborts under real load. Roll back by removing
+the env var and restoring the seed pins to 42.
 
 ## Next technical lever (after shipping, or instead of shipping now)
 
@@ -102,6 +185,166 @@ the grid's blocks. Two directions, in rough value order:
 
 Cheaper follow-ups: parallelize the talker attention across more blocks
 (split-K over positions); tune blocks/CU per n_past.
+
+**Device-resident chaining — DONE (2026-09-12), perf-neutral.**
+`HipCodePredictor::run_device()` takes a device pointer for the talker
+hidden (skips the 4 KB H2D); `generate()` skips the talker's 4 KB
+hidden D2H when the fused talker produced it (kept only under
+`QWEN3_TTS_DUMP_LOGITS` for the diagnostic) and threads the pointer
+via a `prev_hidden_device` flag (frame 0's hidden is the ggml prefill
+on the host; a Gate-1 fallback flips it back to host). Verified
+**byte-identical** output vs the pre-chaining path (same seed/text, 3
+runs) — the device path reads the same source buffer, so it's
+equivalence-by-construction. Gate-1 fallback + talker parity tests pass.
+**Measured win: none** — talker 2.2 ms + cp ~8.6 ms before and after;
+the 8 KB PCIe round-trip is ~1-2 us/frame, lost in contention noise.
+Kept as fusion plumbing, not deployed for perf (production binary is
+unchanged until the next meaningful restart).
+
+**Revised lever ranking after measuring:** the per-frame budget under
+live contention is talker 2.2 + cp 8.6 + host tail 0.47 ms. The cp
+stage dominates and is contention-sensitive (5.9 ms idle -> 8.6 ms with
+llama-server resident). The two remaining real levers, in value order:
+1. **Single fused talker+cp kernel** — one cooperative launch produces
+   cb0 + all 15 codes + the next step_embd on device, removing the
+   cb0 round-trip, the cp's separate launch, and the 0.47 ms host
+   embed tail from the critical path (~4% + a sync). Biggest win,
+   biggest change, and a larger cooperative grid is harder to schedule
+   on the busy GPU (Gate 1 fallback becomes load-bearing).
+2. **Device-side embed lookup** — fold the step_embd assembly
+   (codec_embd(cb0) + code_pred_embd sum + trailing row) into the cp
+   kernel output so the host never builds it; removes the 0.47 ms
+   serial tail (~4%) without the full fusion. Cheaper than (1),
+   same tail win.
+
+**Device-side embed lookup — DONE & DEPLOYED (2026-09-12).**
+`HipCodePredictor::assemble_step_embd(trailing_row)` runs a small
+non-cooperative kernel (`k_assemble_step_embd`) that folds the 16
+embedding rows (codec_embd[cb0] + the 15 code_pred_embd rows for the
+codes just sampled, read from the cp's device `d_codes`) + the trailing
+text row into a device `d_step_embd`, in the host's exact summation
+order so the F32 result is **bit-identical** to the host path.
+`HipTalker::run_device()` (D2D copy into the residual buffer) consumes
+it. `generate()` gates this on `chain_embed = fused_talker &&
+cp_last_frame_fused_` — if the fused cp falls back to GGML the flag is
+false and the host assembly takes over (verified: a contention-induced
+cp fallback correctly reverts and still completes). Measured: host tail
+**0.47 -> 0.03 ms/frame** (embed lookups bucket 0.47 -> ~0.0); output
+byte-identical to the pre-chaining baseline across runs where the fused
+path holds. Gate-1 fallback + talker + cp parity tests pass. Deployed
+to `tts-engine` (restart picked up the new binary; production journal
+shows host tail 0.03 ms/frame, no fallbacks).
+The talker's 2.2-vs-1.3 ms floor is barrier count (~170 grid
+barriers/step); reducing phases is a kernel redesign with less
+end-to-end value than (1)/(2) right now.
+
+### THE NEXT TASK — single fused talker+cp kernel
+
+Both chaining steps above are the groundwork for this. The goal: replace
+the per-frame `HipTalker::run_device()` + `HipCodePredictor::run_device()`
++ `assemble_step_embd()` (three launches, three syncs) with **one
+cooperative kernel** that does the whole frame on-device:
+
+1. talker 28-layer step (reads the previous frame's `d_step_embd`,
+   writes cb0 + hidden + the F16 KV cache row at `n_past`),
+2. cp 16-position loop (position 0 = talker hidden, position 1 =
+   codec_embd(cb0), positions 2..15 = code_pred_embd rows of the
+   sampled codes) producing the 15 codes,
+3. the step_embd assembly for the NEXT frame (the `k_assemble_step_embd`
+   math) — so the host only reads back the 16 codes + cb0 and never
+   touches hidden or step_embd.
+
+Design considerations:
+- **Shared barrier schedule.** The talker's ~170 barriers/step and the
+  cp's 16-position × ~8-phase barriers must interleave in one grid.
+  Reuse the deadline-aware `grid_barrier` from both kernels (same
+  sense-reversing pattern); the fused kernel needs one `bar` buffer and
+  one `spin_cap`.
+- **Residency math is the risk.** The fused grid must be co-resident in
+  one cooperative launch. The talker alone uses 192 blocks (4/CU × 61
+  CU on the 7900 XTX); the cp uses the same 192. A fused kernel with
+  the union of their LDS/register pressure may drop blocks/CU and shrink
+  the grid — measure `hipOccupancyMaxActiveBlocksPerMultiprocessor`
+  for the fused kernel first. A larger cooperative grid is harder to
+  schedule on the busy GPU, which makes the Gate-1 fallback load-bearing
+  (the fused kernel must return false on barrier timeout exactly like
+  the talker does, and `generate()` must fall back to the current
+  three-launch chained path, NOT to ggml, so the win degrades
+  gracefully).
+- **Keep the existing three-launch path as the fallback.** Don't remove
+  `run_device`/`assemble_step_embd` — they become the fallback when the
+  fused kernel can't launch. The `chain_embed`/`prev_hidden_device`
+  flags already model "device-resident vs host" and can extend to
+  "fused vs chained".
+- **Parity anchor.** Bit-identical output vs the current chained path
+  (same summation order, same sampling RNG seeds per position) is the
+  correctness bar — same as the chaining. Use the existing
+  `test_hip_talker` / `test_hip_code_pred` reference dumps as anchors
+  and add a fused-frame test comparing the 16 codes + next step_embd.
+- **Don't touch production until it's parity-verified and the fallback
+  is tested** (same discipline as Gates 1-3).
+
+Expected win: removes one full sync + the cp's separate launch + the
+cb0/hidden round-trips from the critical path. The talker+cp are
+already device-resident after the chaining, so the fused kernel mostly
+saves launch/sync overhead (~0.5-1 ms/frame) rather than PCIe.
+
+**Single fused talker+cp frame kernel — DONE & PARITY-VERIFIED
+(2026-09-12). NOT yet deployed to `tts-engine` (awaiting a parity
+audition on the live box before cutover, same discipline as Gates 1-3).**
+
+`src/hip/frame_fused.{h,hip}` — `HipFrameFusion::run_frame()` does the
+whole frame in ONE cooperative launch: copy step_embd→x, talker 28-layer
+step (→ hidden + cb0 into `codes[0]` + the F16 KV row at `n_past`), the
+cp 16-position loop (→ `codes[1..15]`), then the next-frame step_embd
+assembly. The host reads back only the 16 codes (`get_codes`). The
+talker's ~170 barriers and the cp's 16×~8 barriers share ONE
+deadline-aware `grid_barrier` buffer + ONE spin cap — the shared device
+helpers (incl. `grid_barrier`) were lifted out of the two shipped kernels
+into `src/hip/hip_dev.h` (verbatim move; the shipped kernels now include
+it, so there is a single source of truth for the barrier).
+
+- **Residency (the risk): MEASURED, no regression.**
+  `hipOccupancyMaxActiveBlocksPerMultiprocessor` for `k_frame_fused` =
+  **4 blocks/CU**, identical to the standalone talker and cp kernels →
+  same 192-block cooperative grid. The fused kernel's union of register/
+  LDS pressure does NOT drop blocks/CU, so the grid is no harder to
+  schedule than the existing ones. Logged at init: `HIP fused frame: N
+  blocks (X/CU)`.
+- **Parity: BIT-IDENTICAL to the three-launch chained path.**
+  `test_hip_frame_fused` runs both paths on the same reference step with
+  the same seeds and the seen set reset between: cb0 match, 15/15 codes,
+  next step_embd `memcmp` equal (max|diff| 0.0). Greedy AND sampled
+  (temp 0.9 / top-k 50). E2E CLI: fused-frame wav is byte-identical to
+  the chained wav across a 120-frame generation, greedy and sampled — the
+  per-frame seed order (talker seed then cp seed drawn at end of frame N)
+  keeps the whole rng stream aligned with the chained path.
+- **Fallback: chained path, NOT ggml.** On `run_frame` barrier timeout,
+  `generate()` latches `hip_frame_failed_`, re-syncs the device `seen[]`
+  set from `generated_cb0_tokens` (mirror of Gate 1), and the existing
+  three-launch chained tail redoes the frame; subsequent frames run the
+  chained path. `run_device`/`assemble_step_embd` are untouched.
+  `test_hip_frame_fallback` drives this deterministically via the
+  `QWEN3_TTS_TEST_FRAME_FAIL_AFTER=<n>` hook in `run_frame` (fails the
+  Nth call, simulating a mid-generation busy-GPU timeout) — asserts the
+  request completes, the fallback fires exactly once (latch holds), and
+  all frames are produced. (A raw hog does NOT trip the fused frame the
+  way it trips the talker: the fused frame is one long cooperative kernel
+  that reliably gets a full-residency slice, whereas the bootstrap cp
+  fails first and skips the fused launch — hence the deterministic hook.)
+- **Enable:** `QWEN3_TTS_USE_HIP_FRAME_FUSION=1` alongside
+  `QWEN3_TTS_USE_HIP_TALKER=1` + `QWEN3_TTS_USE_HIP_CODE_PRED=1`
+  (frame fusion requires both; it force-inits the cp before the loop).
+  Default off.
+- **Measured (idle-ish GPU, 120 frames):** fused frame 7.9 ms/frame
+  device time replaces the chained talker 2.3 + cp 6.7 + host-tail
+  0.03; loop wall 1073→964 ms, throughput 11.8→11.3 ms/frame. The win
+  is the removed launch/sync overhead, as predicted. Re-measure under
+  llama-server contention before trusting the number.
+- **Tests:** `test_hip_frame_fused` (parity), `test_hip_frame_fallback`
+  (fallback). Existing `test_hip_talker` / `test_hip_code_pred` /
+  `test_hip_talker_fallback` all still pass after the `hip_dev.h`
+  refactor.
 
 ## Build / test / bench (host, this machine)
 
@@ -128,6 +371,22 @@ QWEN3_TTS_DUMP_TALKER=/tmp/talker_ref_step.bin \
 LONG="...a few sentences..."
 QWEN3_TTS_USE_HIP_CODE_PRED=1 ./build-hip-host/qwen3-tts-cli ... -t "$LONG" --temperature 0 --max-tokens 400
 QWEN3_TTS_USE_HIP_TALKER=1 QWEN3_TTS_USE_HIP_CODE_PRED=1 ./build-hip-host/qwen3-tts-cli ... -t "$LONG" --temperature 0 --max-tokens 400
+
+# fused-frame parity (bit-identical vs chained) + fallback
+./build-hip-host/test_hip_frame_fused --model models/qwen3-tts-0.6b-f16.gguf \
+  --ref /tmp/talker_ref_step.bin --iters 10
+QWEN3_TTS_TEST_TEMP=0.9 QWEN3_TTS_TEST_TOPK=50 \
+  ./build-hip-host/test_hip_frame_fused --model models/qwen3-tts-0.6b-f16.gguf \
+  --ref /tmp/talker_ref_step.bin --iters 10
+./build-hip-host/test_hip_frame_fallback --model models/qwen3-tts-0.6b-f16.gguf \
+  --frames 24 --fail-after 2
+
+# e2e byte-identical check: fused-frame vs chained
+QWEN3_TTS_USE_HIP_TALKER=1 QWEN3_TTS_USE_HIP_CODE_PRED=1 ./build-hip-host/qwen3-tts-cli \
+  ... --seed 2 -o /tmp/chained.wav
+QWEN3_TTS_USE_HIP_TALKER=1 QWEN3_TTS_USE_HIP_CODE_PRED=1 QWEN3_TTS_USE_HIP_FRAME_FUSION=1 \
+  ./build-hip-host/qwen3-tts-cli ... --seed 2 -o /tmp/fused.wav
+cmp /tmp/chained.wav /tmp/fused.wav
 ```
 
 ## Gotchas
