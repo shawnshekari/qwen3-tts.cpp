@@ -238,6 +238,61 @@ struct tts_transformer_state {
     bool code_pred_graphs_tried = false;
 };
 
+#ifdef QWEN3_TTS_HIP
+// Self-healing latch for a fused cooperative HIP component (talker / cp /
+// fused-frame). A grid-barrier timeout under GPU contention latches the
+// fused path off. Rather than staying off for the whole process (which
+// pins latency to the GGML path until a manual restart — see
+// docs/talker_fusion_handoff.md "KNOWN ISSUE"), we periodically re-probe
+// the fused path so it recovers automatically once the GPU quiets.
+//
+// Policy: probe every `backoff` requests while latched. A failed probe
+// doubles `backoff` (capped) so a persistently-busy GPU stops paying the
+// probe's spin-deadline stall; the first successful probe resets it to
+// 1. Init failures are permanent (begin_request returns false forever),
+// so a component that never inited is never probed.
+//
+// The probe itself is NOT a special code path: begin_request just clears
+// the component's `*_failed_` gate for one request and the caller runs
+// the existing fused path (with a tightened barrier spin cap) through the
+// normal fallback machinery, so the Gate-1 seen[] re-sync invariant holds
+// unchanged if the probe fails mid-request.
+struct HipHeal {
+    bool latched = false;   // fused path currently disabled by a timeout
+    bool probing = false;   // this request is a probe of a latched path
+    int backoff = 1;        // probe every `backoff` requests
+    int since = 0;          // requests since the last latch / probe
+    static const int kMaxBackoff = 64;
+
+    // Decide whether to attempt the fused path this request. `ready` is
+    // the component's init-succeeded flag. Returns true to attempt; sets
+    // `probing` when this request is a probe of a latched path.
+    bool begin_request(bool ready) {
+        probing = false;
+        if (!ready) return false;
+        if (!latched) return true;
+        if (++since >= backoff) {
+            latched = false;
+            since = 0;
+            probing = true;
+            return true;
+        }
+        return false;
+    }
+    // A fused launch failed this request: latch and grow the backoff.
+    void note_failure() {
+        latched = true;
+        if (backoff < kMaxBackoff) backoff *= 2;
+        since = 0;
+    }
+    // The request ran the fused path successfully: heal and reset.
+    void note_success() {
+        if (probing) { backoff = 1; since = 0; }
+        probing = false;
+    }
+};
+#endif
+
 // TTS Transformer class
 class TTSTransformer {
 public:
@@ -497,6 +552,17 @@ private:
     class HipFrameFusion * hip_frame_ = nullptr;
     bool hip_frame_ready_ = false;
     bool hip_frame_failed_ = false;
+
+    // Self-healing latch state (see HipHeal). One per fused component.
+    // Persist across generate() calls so a contention latch recovers on
+    // its own once the GPU quiets. The `*_ran_` flags track whether the
+    // component's fused path actually executed at least one launch this
+    // request, so a probe that never reached a launch (e.g. a 1-frame
+    // request) is treated as inconclusive rather than a false heal.
+    HipHeal talker_heal_, cp_heal_, frame_heal_;
+    bool talker_fused_ran_ = false;
+    bool cp_fused_ran_ = false;
+    bool frame_fused_ran_ = false;
 #endif
 
 #ifdef QWEN3_TTS_TIMING

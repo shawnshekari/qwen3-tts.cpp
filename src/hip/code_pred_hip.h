@@ -100,6 +100,10 @@ public:
 
     int grid_blocks() const { return grid_blocks_; }
 
+    // Self-heal probe mode: tighten the cooperative barrier spin cap so a
+    // probe of a latched path gives up fast on a still-busy GPU.
+    void set_probe_mode(bool tight);
+
 private:
     struct impl;
     impl * p_ = nullptr;

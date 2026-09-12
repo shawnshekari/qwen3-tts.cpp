@@ -662,6 +662,8 @@ struct HipFrameFusion::impl {
     ff_work B = {};
     hipEvent_t ev0 = nullptr, ev1 = nullptr;
     hipStream_t stream = nullptr;
+    unsigned long long normal_spin_cap = 0;
+    unsigned long long probe_spin_cap = 0;
 };
 
 HipFrameFusion::HipFrameFusion() = default;
@@ -731,9 +733,17 @@ bool HipFrameFusion::init(const tl_params & tp, const tl_weights & tw,
     CK(hipMalloc((void **) &B.bar, 3 * sizeof(unsigned)));
     CK(hipMemset((void *) B.bar, 0, 3 * sizeof(unsigned)));
     // ~0.5 s at a few ns per spin; legitimate stragglers are <1 ms.
-    p_->B.spin_cap = 50000000ull;
-    if (const char * e = getenv("QWEN3_TTS_HIP_BARRIER_SPINS")) p_->B.spin_cap = strtoull(e, nullptr, 10);
+    p_->normal_spin_cap = 50000000ull;
+    if (const char * e = getenv("QWEN3_TTS_HIP_BARRIER_SPINS")) p_->normal_spin_cap = strtoull(e, nullptr, 10);
+    p_->probe_spin_cap = p_->normal_spin_cap / 10;
+    if (p_->probe_spin_cap < 1) p_->probe_spin_cap = 1;
+    p_->B.spin_cap = p_->normal_spin_cap;
     return true;
+}
+
+void HipFrameFusion::set_probe_mode(bool tight) {
+    if (!p_) return;
+    p_->B.spin_cap = tight ? p_->probe_spin_cap : p_->normal_spin_cap;
 }
 
 void HipFrameFusion::release() {

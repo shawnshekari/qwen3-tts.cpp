@@ -121,8 +121,9 @@ int main(int argc, char ** argv) {
     const bool gen_ok = tf.generate(text.data(), (int) text.size(), spk.data(), frames, out,
                                    2050, 1.05f, 0.9f, 50);
 
-    // Second request in the same process: the first-failure latch must
-    // keep the fused talker off, so no further fallback lines appear.
+    // Second request in the same process: with self-heal the latch is no
+    // longer permanent — the second request re-probes the fused talker
+    // (which fails again under the still-running hog, then re-latches).
     std::vector<int32_t> out2;
     const bool gen2_ok = tf.generate(text.data(), (int) text.size(), spk.data(), frames, out2,
                                     2050, 1.05f, 0.9f, 50);
@@ -158,14 +159,25 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "FAIL: fused talker completed under saturation — fallback never exercised\n");
         return 1;
     }
-    if (fallbacks > 1) {
-        fprintf(stderr, "FAIL: latch did not hold — fused talker retried after first failure\n");
+    // Self-heal contract (replaces the old "latch never retries"): the
+    // second request must re-probe the latched fused talker, the probe
+    // must fail under the still-running hog, and it must re-latch.
+    const bool reprobe = log.find("self-heal: probing fused talker") != std::string::npos;
+    const bool relatch = log.find("self-heal: fused talker probe failed") != std::string::npos;
+    if (!reprobe) {
+        fprintf(stderr, "FAIL: second request did not re-probe the latched fused talker\n");
+        fputs(log.c_str(), stderr);
+        return 1;
+    }
+    if (!relatch) {
+        fprintf(stderr, "FAIL: re-probe did not re-latch after failing under saturation\n");
+        fputs(log.c_str(), stderr);
         return 1;
     }
     if (n_frames == 0 || n_frames2 == 0) {
         fprintf(stderr, "FAIL: no frames produced via fallback\n");
         return 1;
     }
-    printf("PASS: request completed via ggml fallback under GPU saturation; latch held on the second request\n");
+    printf("PASS: requests completed via ggml fallback under GPU saturation; latch re-armed and re-probed on the second request\n");
     return 0;
 }

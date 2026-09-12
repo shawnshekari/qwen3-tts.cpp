@@ -123,6 +123,12 @@ public:
 
     int grid_blocks() const { return grid_blocks_; }
 
+    // Self-heal probe mode: tighten the cooperative barrier spin cap so a
+    // probe of a latched path gives up fast on a still-busy GPU instead
+    // of stalling the full normal deadline. tight=true for a probe
+    // request, false to restore the normal (generous) cap.
+    void set_probe_mode(bool tight);
+
 private:
     bool run_impl(const float * step_embd, bool step_is_device, int32_t n_past, const tl_kv & kv,
                  float temperature, int32_t top_k, float repetition_penalty,

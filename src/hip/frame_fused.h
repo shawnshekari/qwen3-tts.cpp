@@ -81,6 +81,10 @@ public:
     int grid_blocks() const { return grid_blocks_; }
     int occupancy_per_cu() const { return occ_per_cu_; }
 
+    // Self-heal probe mode: tighten the cooperative barrier spin cap so a
+    // probe of a latched fused-frame path gives up fast on a busy GPU.
+    void set_probe_mode(bool tight);
+
 private:
     struct impl;
     impl * p_ = nullptr;

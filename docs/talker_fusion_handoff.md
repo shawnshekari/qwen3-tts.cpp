@@ -26,11 +26,12 @@ ms/frame, RTF ~0.14, zero fallbacks.
 - The toolbox `build-hip/` is no longer used by the service (kept for
   reference). The host `build-hip-host/` is the production build.
 
-> ⚠️ **LIVE REGRESSION (2026-09-12):** the running process has latched
-> both fused kernels to GGML after barrier timeouts under contention —
-> RTF is ~0.21, not the ~0.13/0.14 fused steady state. Restart the
-> engine on a quiet GPU to recover. See **KNOWN ISSUE** below for the
-> full diagnosis and the deferred self-healing discussion.
+> ⚠️ **LIVE REGRESSION (2026-09-12):** the running process latched both
+> fused kernels to GGML after barrier timeouts under contention — RTF
+> ~0.21 vs the ~0.13/0.14 fused steady state. **Self-healing is now
+> implemented** (see KNOWN ISSUE below): the engine re-probes the fused
+> path on its own and recovers once the GPU quiets, so no manual restart
+> is needed — just keep serving requests.
 
 ## Next session: single fused talker+cp kernel
 
@@ -193,24 +194,52 @@ the GPU is quiet (llama-server/embedding idle) so the fused path
 re-engages. Restarting *during* saturation just re-times-out and
 re-latches (and risks the voice-registration race — see Gate 3).
 
-**Deferred design discussion — self-healing (NOT implemented yet).**
-Candidate directions to evaluate later:
-- *Auto-unlatch with cooldown:* after latching, periodically (e.g. every
-  N requests or T seconds) probe the cooperative grid with a single
-  cheap frame; if it succeeds, un-latch and resume the fused path.
-- *Per-frame retry instead of process latch:* don't latch permanently;
-  retry the fused path each frame and only fall back for the frame that
-  timed out. (Cost: a timed-out frame wastes the spin deadline before
-  falling back — need to bound the deadline so the fallback is still
-  faster than GGML.)
-- *Adaptive spin deadline:* widen the barrier spin cap when the GPU is
-  known-busy so the cooperative grid gets a longer slice before timing
-  out (trades latency for fewer latches).
-- *Contention-aware scheduling:* have the engine observe GPU utilization
-  and defer/pace fused launches when co-resident load is high.
-None of these are started. Decide the policy before writing code — the
-correctness invariant (seen[] re-sync across the fused/GGML boundary,
-Gate 1) must hold for whichever retry path is chosen.
+**Self-healing — IMPLEMENTED (2026-09-12).** The one-way latch is now a
+re-armable `HipHeal` state machine (`src/tts_transformer.h`), one per
+fused component (talker / cp / fused-frame), driven at the request
+boundary in `generate()`:
+
+- *Cooldown-gated probe + exponential backoff:* while latched, every
+  `backoff` requests we clear the component's gate for one request and
+  re-attempt the fused path. A failed probe doubles `backoff` (capped at
+  64) so a persistently-busy GPU stops paying the probe's spin-deadline
+  stall; the first successful probe resets it to 1 and the fused path is
+  back. The first latch probes on the very next request (backoff 1) for
+  fast recovery.
+- *Tight probe deadline:* `set_probe_mode(true)` (on `HipTalker` /
+  `HipCodePredictor` / `HipFrameFusion`) drops the barrier spin cap to
+  1/10 of normal (~50 ms vs ~500 ms) for the probe request, so a probe
+  into a still-busy GPU gives up fast instead of stalling the full
+  deadline. Restored to normal on heal.
+- *Not a special code path:* the probe just clears the existing
+  `*_failed_` gate and runs the normal fused path through the existing
+  fallback machinery, so the Gate-1 `seen[]` re-sync invariant holds
+  unchanged if the probe fails mid-request.
+- *Init failures stay permanent:* `begin_request(ready)` never probes a
+  component whose init failed (`*_ready_` false), so a config error isn't
+  retried forever.
+- *Observability:* the journal logs `HIP self-heal: probing fused
+  talker/cp/frame`, `... probe failed, backoff N`, and `... recovered`.
+
+To recover the live regression now: just keep serving requests — the
+engine re-probes on its own and flips back to the fused path once the
+GPU quiets (no restart needed). Restarting on a quiet GPU still works
+and is instant, but is no longer required.
+
+**Tests:** `test_hip_heal` (pure-logic policy: cadence, exponential
+growth, cap, init-failure permanence, full latch→quiet→recover cycle).
+`test_hip_talker_fallback` updated to the new contract (second request
+re-probes + re-latches under the hog instead of asserting a permanent
+latch). `test_hip_frame_fallback` given a fixed seed (it samples at
+temp 0.9 and was nondeterministically hitting early EOS). Manual GPU
+test: saturate the GPU to trip the latch, then idle it and watch the
+journal for the `recovered` line.
+
+**Rejected alternatives** (kept for context): per-frame retry (worst —
+every frame pays the spin-deadline under sustained contention);
+adaptive-widen deadline (just converts fast-fallback into slow-fallback);
+GPU-util polling (coarse/laggy metric + polling overhead — the probe is
+a cleaner form of sensing).
 
 ## Enabling, once gates pass
 

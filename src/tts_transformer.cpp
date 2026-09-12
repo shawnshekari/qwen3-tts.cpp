@@ -49,6 +49,11 @@ void TTSTransformer::unload_model() {
     hip_code_pred_ = nullptr;
     hip_code_pred_ready_ = false;
     hip_code_pred_failed_ = false;
+    // Reset self-heal state so a fresh load starts with a clean probe clock.
+    talker_heal_ = HipHeal{};
+    cp_heal_ = HipHeal{};
+    frame_heal_ = HipHeal{};
+    talker_fused_ran_ = cp_fused_ran_ = frame_fused_ran_ = false;
 #endif
 
     if (state_.sched) {
@@ -2850,6 +2855,7 @@ bool TTSTransformer::predict_codes_autoregressive_hip(const float * hidden, int3
     }
     output.assign(codes.begin(), codes.end());
     cp_last_frame_fused_ = true;
+    cp_fused_ran_ = true;
     return true;
 }
 
@@ -3526,6 +3532,38 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     };
 
 #ifdef QWEN3_TTS_HIP
+    // Self-heal: if a prior request latched a fused component off after a
+    // GPU-contention barrier timeout, periodically re-probe it so the
+    // fused path recovers on its own once the GPU quiets (no manual
+    // restart). A probe just clears the component's gate for this request
+    // and tightens its barrier spin cap so a still-busy GPU fails fast;
+    // the existing fallback machinery (incl. the Gate-1 seen[] re-sync)
+    // handles a probe that fails mid-request. Init failures are permanent
+    // (begin_request never probes them). See HipHeal in the header.
+    talker_fused_ran_ = cp_fused_ran_ = frame_fused_ran_ = false;
+    const bool t_attempt = talker_heal_.begin_request(hip_talker_ready_);
+    if (talker_heal_.probing) {
+        hip_talker_failed_ = false;
+        if (hip_talker_) hip_talker_->set_probe_mode(true);
+        fprintf(stderr, "  HIP self-heal: probing fused talker\n");
+    }
+    cp_heal_.begin_request(hip_code_pred_ready_);
+    if (cp_heal_.probing) {
+        hip_code_pred_failed_ = false;
+        if (hip_code_pred_) hip_code_pred_->set_probe_mode(true);
+        fprintf(stderr, "  HIP self-heal: probing fused code predictor\n");
+    }
+    // The fused-frame path needs the fused talker, so only probe it when
+    // the talker is being attempted this request.
+    frame_heal_.begin_request(hip_frame_ready_ && t_attempt);
+    if (frame_heal_.probing) {
+        hip_frame_failed_ = false;
+        if (hip_frame_) hip_frame_->set_probe_mode(true);
+        fprintf(stderr, "  HIP self-heal: probing fused frame\n");
+    }
+#endif
+
+#ifdef QWEN3_TTS_HIP
     // Fused talker: one cooperative kernel per frame replaces forward_step
     // and samples cb0 on device (suppression + repetition penalty tracked
     // in a device-side seen set + temp/top-k). Frame 0's cb0 still comes
@@ -3744,6 +3782,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                     fused_frame_active = true;
                     fused_frame_ran = true;
                     prev_hidden_device = true;
+                    frame_fused_ran_ = true;
+                    cp_fused_ran_ = true;  // the fused cp ran inside the frame
 #ifdef QWEN3_TTS_TIMING
                     timing.t_fused_frame_ms += hip_frame_->last_run_us() * 1e-3;
 #endif
@@ -3855,6 +3895,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                   nullptr, /*fused=*/true, &terr);
             if (ran) {
                 fused_step_ok = true;
+                talker_fused_ran_ = true;
                 prev_hidden_device = true;
             } else {
                 // Gate 1 (talker_fusion_handoff.md): the cooperative grid
@@ -3899,6 +3940,55 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         t_loop_total_ms += std::chrono::duration<double, std::milli>(clk::now() - t_loop_start).count();
 #endif
     }
+
+#ifdef QWEN3_TTS_HIP
+    // Self-heal bookkeeping at the end of the request (pairs with the
+    // heal-start block). For each component we probed this request: if its
+    // fused path actually ran and did not re-latch, it recovered (reset
+    // backoff); otherwise it failed or was inconclusive (never reached a
+    // launch) -> grow the backoff so a persistently-busy GPU stops paying
+    // probe stalls. Components we did not probe but that are latched stay
+    // latched; begin_request drives the probe clock next request.
+    if (talker_heal_.probing) {
+        if (talker_fused_ran_ && !hip_talker_failed_) {
+            talker_heal_.note_success();
+            fprintf(stderr, "  HIP self-heal: fused talker recovered\n");
+        } else {
+            talker_heal_.note_failure();
+            fprintf(stderr, "  HIP self-heal: fused talker probe failed, backoff %d\n",
+                    talker_heal_.backoff);
+        }
+        if (hip_talker_) hip_talker_->set_probe_mode(false);
+    } else if (hip_talker_ready_ && hip_talker_failed_) {
+        talker_heal_.latched = true;
+    }
+    if (cp_heal_.probing) {
+        if (cp_fused_ran_ && !hip_code_pred_failed_) {
+            cp_heal_.note_success();
+            fprintf(stderr, "  HIP self-heal: fused code predictor recovered\n");
+        } else {
+            cp_heal_.note_failure();
+            fprintf(stderr, "  HIP self-heal: fused code predictor probe failed, backoff %d\n",
+                    cp_heal_.backoff);
+        }
+        if (hip_code_pred_) hip_code_pred_->set_probe_mode(false);
+    } else if (hip_code_pred_ready_ && hip_code_pred_failed_) {
+        cp_heal_.latched = true;
+    }
+    if (frame_heal_.probing) {
+        if (frame_fused_ran_ && !hip_frame_failed_) {
+            frame_heal_.note_success();
+            fprintf(stderr, "  HIP self-heal: fused frame recovered\n");
+        } else {
+            frame_heal_.note_failure();
+            fprintf(stderr, "  HIP self-heal: fused frame probe failed, backoff %d\n",
+                    frame_heal_.backoff);
+        }
+        if (hip_frame_) hip_frame_->set_probe_mode(false);
+    } else if (hip_frame_ready_ && hip_frame_failed_) {
+        frame_heal_.latched = true;
+    }
+#endif
 
     last_decode_ms_ = verbose_now_ms() - t_prefill_end_ms;
 

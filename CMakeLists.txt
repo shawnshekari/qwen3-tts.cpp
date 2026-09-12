@@ -314,6 +314,13 @@ if(GGML_HIP)
     # generate() fall back to the chained path (NOT ggml).
     add_executable(test_hip_frame_fallback tests/test_hip_frame_fallback.cpp)
     target_link_libraries(test_hip_frame_fallback PRIVATE tts_transformer ggml hip::host)
+
+    # Self-heal policy unit test (docs/talker_fusion_handoff.md, "KNOWN
+    # ISSUE"): pure-logic test of the HipHeal state machine that drives
+    # automatic recovery of a fused component latched off by a GPU-contention
+    # barrier timeout. No GPU needed.
+    add_executable(test_hip_heal tests/test_hip_heal.cpp)
+    target_link_libraries(test_hip_heal PRIVATE tts_transformer ggml hip::host)
 endif()
 
 # Streaming-vs-oneshot parity test for the audio decoder

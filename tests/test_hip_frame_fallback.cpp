@@ -83,6 +83,10 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> text = {14990, 4790, 323, 4667, 9745};
     std::vector<float> spk(cfg.hidden_size, 0.0f);
     std::vector<int32_t> out;
+    // Fixed seed: the test samples at temp 0.9, so without a seed the
+    // sampled cb0 can hit EOS before `frames` and the run is
+    // nondeterministic. This seed produces a >= `frames`-length output.
+    tf.set_seed(1234);
 
     fflush(stderr);
     int saved_err = dup(STDERR_FILENO);
