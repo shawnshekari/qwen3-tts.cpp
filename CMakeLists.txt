@@ -80,6 +80,16 @@ if(GGML_VULKAN)
     )
 endif()
 
+# The HIP language must be enabled before any target below is declared, or
+# they end up with an empty HIP_ARCHITECTURES (used by src/hip/).
+if(GGML_HIP)
+    if(AMDGPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES ${AMDGPU_TARGETS})
+    endif()
+    enable_language(HIP)
+    find_package(hip REQUIRED)
+endif()
+
 # Text tokenizer library
 add_library(text_tokenizer STATIC
     src/text_tokenizer.cpp
@@ -250,6 +260,21 @@ target_link_libraries(test_decoder PRIVATE
     audio_tokenizer_decoder
     Threads::Threads
 )
+
+# Fused HIP code predictor (docs/code_predictor_plan.md, Phase 2) and its
+# reference test. HIP-only: the kernel needs cooperative groups.
+if(GGML_HIP)
+    add_library(code_pred_hip STATIC src/hip/code_pred_hip.hip)
+    set_source_files_properties(src/hip/code_pred_hip.hip PROPERTIES LANGUAGE HIP)
+    target_include_directories(code_pred_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(code_pred_hip PUBLIC hip::host)
+
+    target_link_libraries(tts_transformer PUBLIC code_pred_hip)
+    target_compile_definitions(tts_transformer PUBLIC QWEN3_TTS_HIP)
+
+    add_executable(test_hip_code_pred tests/test_hip_code_pred.cpp)
+    target_link_libraries(test_hip_code_pred PRIVATE code_pred_hip ggml hip::host)
+endif()
 
 # Streaming-vs-oneshot parity test for the audio decoder
 add_executable(test_streaming_parity

@@ -2,6 +2,11 @@
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 
+#ifdef QWEN3_TTS_HIP
+#include "hip/code_pred_hip.h"
+#include <hip/hip_runtime.h>
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -34,6 +39,13 @@ void TTSTransformer::unload_model() {
     use_coreml_code_predictor_ = false;
     coreml_code_predictor_path_.clear();
     skip_ggml_code_pred_layers_ = false;
+
+#ifdef QWEN3_TTS_HIP
+    delete hip_code_pred_;
+    hip_code_pred_ = nullptr;
+    hip_code_pred_ready_ = false;
+    hip_code_pred_failed_ = false;
+#endif
 
     if (state_.sched) {
         ggml_backend_sched_free(state_.sched);
@@ -2690,6 +2702,102 @@ bool TTSTransformer::predict_codes_autoregressive_coreml(const float * hidden,
     return true;
 }
 
+#ifdef QWEN3_TTS_HIP
+bool TTSTransformer::init_hip_code_pred() {
+    hip_code_pred_failed_ = true;
+    const auto & cfg = model_.config;
+    if ((cfg.code_pred_hidden_size != 0 && cfg.code_pred_hidden_size != cfg.hidden_size) ||
+        cfg.n_codebooks != 16) {
+        error_msg_ = "HIP fused code predictor supports only the 0.6B shape (shared hidden, 16 codebooks)";
+        return false;
+    }
+
+    cp_params P;
+    P.hidden    = cfg.hidden_size;
+    P.n_head    = cfg.n_attention_heads;
+    P.n_kv_head = cfg.n_key_value_heads;
+    P.head_dim  = cfg.head_dim;
+    P.ff        = cfg.code_pred_intermediate_size ? cfg.code_pred_intermediate_size : cfg.intermediate_size;
+    P.vocab     = cfg.code_pred_vocab_size;
+    P.n_layer   = (int) model_.code_pred_layers.size();
+    P.eps       = cfg.rms_norm_eps;
+    P.rope_theta = cfg.rope_theta;
+
+    auto to_dev = [&](ggml_tensor * t, ggml_type want, const uint16_t ** out) -> bool {
+        if (!t || t->type != want) {
+            error_msg_ = std::string("HIP cp: unexpected tensor for ") + (t ? ggml_get_name(t) : "(null)");
+            return false;
+        }
+        const size_t n = ggml_nbytes(t);
+        std::vector<uint8_t> buf(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, n);
+        void * d = nullptr;
+        if (hipMalloc(&d, n) != hipSuccess) { error_msg_ = "HIP cp: hipMalloc failed"; return false; }
+        if (hipMemcpy(d, buf.data(), n, hipMemcpyHostToDevice) != hipSuccess) {
+            hipFree(d);
+            error_msg_ = "HIP cp: hipMemcpy failed";
+            return false;
+        }
+        *out = (const uint16_t *) d;
+        return true;
+    };
+
+    cp_weights W = {};
+    for (int il = 0; il < P.n_layer; ++il) {
+        const transformer_layer & L = model_.code_pred_layers[il];
+        if (!to_dev(L.attn_norm,    GGML_TYPE_F32, &W.attn_norm[il])) return false;
+        if (!to_dev(L.attn_q_norm,  GGML_TYPE_F32, &W.q_norm[il]))    return false;
+        if (!to_dev(L.attn_k_norm,  GGML_TYPE_F32, &W.k_norm[il]))    return false;
+        if (!to_dev(L.ffn_norm,     GGML_TYPE_F32, &W.ffn_norm[il]))  return false;
+        if (!to_dev(L.attn_q,       GGML_TYPE_F16, &W.wq[il]))        return false;
+        if (!to_dev(L.attn_k,       GGML_TYPE_F16, &W.wk[il]))        return false;
+        if (!to_dev(L.attn_v,       GGML_TYPE_F16, &W.wv[il]))        return false;
+        if (!to_dev(L.attn_output,  GGML_TYPE_F16, &W.wo[il]))        return false;
+        if (!to_dev(L.ffn_gate,     GGML_TYPE_F16, &W.w_gate[il]))    return false;
+        if (!to_dev(L.ffn_up,       GGML_TYPE_F16, &W.w_up[il]))      return false;
+        if (!to_dev(L.ffn_down,     GGML_TYPE_F16, &W.w_down[il]))    return false;
+    }
+    if (!to_dev(model_.code_pred_output_norm, GGML_TYPE_F32, &W.output_norm)) return false;
+    if (!to_dev(model_.codec_embd,           GGML_TYPE_F16, &W.talker_codec_embd)) return false;
+    for (int i = 0; i < CP_N_HEADS_OUT; ++i) {
+        if (!to_dev(model_.code_pred_embd[i], GGML_TYPE_F16, &W.codec_embd[i])) return false;
+        if (!to_dev(model_.code_pred_head[i], GGML_TYPE_F16, &W.lm_head[i]))    return false;
+    }
+
+    hip_code_pred_ = new HipCodePredictor();
+    std::string err;
+    if (!hip_code_pred_->init(P, W, &err)) {
+        error_msg_ = "HIP cp init: " + err;
+        delete hip_code_pred_;
+        hip_code_pred_ = nullptr;
+        return false;
+    }
+    hip_code_pred_failed_ = false;
+    hip_code_pred_ready_ = true;
+    fprintf(stderr, "  HIP fused code predictor: %d blocks, %d layers, vocab %d\n",
+            hip_code_pred_->grid_blocks(), P.n_layer, P.vocab);
+    return true;
+}
+
+bool TTSTransformer::predict_codes_autoregressive_hip(const float * hidden, int32_t codebook_0_token,
+                                                     std::vector<int32_t> & output,
+                                                     float temperature, int32_t top_k) {
+    if (!hip_code_pred_ready_) { error_msg_ = "HIP fused code predictor not ready"; return false; }
+    std::vector<int32_t> codes(CP_N_HEADS_OUT);
+    std::uniform_int_distribution<uint64_t> dist(1, ~0ull);
+    const uint64_t seed = dist(rng_);
+    std::string err;
+    // No logits readback: the pipeline only consumes the 60-byte codes.
+    if (!hip_code_pred_->run(hidden, codebook_0_token, temperature, top_k, seed,
+                            codes.data(), nullptr, /*fused=*/true, &err)) {
+        error_msg_ = "HIP fused code predictor: " + err;
+        return false;
+    }
+    output.assign(codes.begin(), codes.end());
+    return true;
+}
+#endif // QWEN3_TTS_HIP
+
 bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t codebook_0_token,
                                                    std::vector<int32_t> & output,
                                                    float temperature, int32_t top_k) {
@@ -2715,7 +2823,22 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         fprintf(stderr, "  CoreML code predictor failed, falling back to GGML: %s\n", error_msg_.c_str());
         use_coreml_code_predictor_ = false;
     }
-    
+
+#ifdef QWEN3_TTS_HIP
+    static const bool use_hip_code_pred =
+        std::getenv("QWEN3_TTS_USE_HIP_CODE_PRED") != nullptr;
+    if (use_hip_code_pred && !hip_code_pred_failed_) {
+        if (!hip_code_pred_ready_ && !init_hip_code_pred()) {
+            fprintf(stderr, "  HIP fused code predictor unavailable, using GGML: %s\n", error_msg_.c_str());
+        } else if (predict_codes_autoregressive_hip(hidden, codebook_0_token, output, temperature, top_k)) {
+            return true;
+        } else {
+            fprintf(stderr, "  HIP fused code predictor failed, falling back to GGML: %s\n", error_msg_.c_str());
+            hip_code_pred_failed_ = true;
+        }
+    }
+#endif
+
     if (state_.code_pred_cache.n_ctx < 16) {
         if (!init_code_pred_kv_cache(16)) {
             return false;
@@ -2791,6 +2914,15 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #endif
 
     if (state_.code_pred_graphs_ready) {
+        // QWEN3_TTS_DUMP_CODE_PRED=<path>: write one frame's inputs, raw
+        // logits and sampled codes as a reference for the HIP kernel
+        // (tests/test_hip_code_pred). First frame only.
+        static const char * dump_path = std::getenv("QWEN3_TTS_DUMP_CODE_PRED");
+        static bool dumped = false;
+        std::vector<float> dump_logits;
+        const bool do_dump = dump_path && !dumped;
+        if (do_dump) dump_logits.reserve((size_t) 15 * cfg.code_pred_vocab_size);
+
         // Prefill with 2 tokens [past_hidden, cb0_embd]
         {
 #ifdef QWEN3_TTS_TIMING
@@ -2815,6 +2947,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             t0 = t1;
 #endif
             ggml_backend_tensor_get(cg.logits, logits_data.data(), 0, cfg.code_pred_vocab_size * sizeof(float));
+            if (do_dump) dump_logits.insert(dump_logits.end(), logits_data.begin(), logits_data.end());
             output[0] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
 #ifdef QWEN3_TTS_TIMING
             t1 = clk::now();
@@ -2850,6 +2983,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             t0 = t1;
 #endif
             ggml_backend_tensor_get(cg.logits, logits_data.data(), 0, cfg.code_pred_vocab_size * sizeof(float));
+            if (do_dump) dump_logits.insert(dump_logits.end(), logits_data.begin(), logits_data.end());
             output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
 #ifdef QWEN3_TTS_TIMING
             t1 = clk::now();
@@ -2859,6 +2993,22 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         if (timing_) timing_->t_code_pred_steps_ms += std::chrono::duration<double, std::milli>(clk::now() - t_steps_start).count();
 #endif
+        if (do_dump) {
+            // layout: i32 {hidden_size, vocab, n_heads=15}, f32 hidden[hidden_size],
+            //         i32 cb0_token, f32 logits[15][vocab], i32 codes[15]
+            FILE * fp = fopen(dump_path, "wb");
+            if (fp) {
+                const int32_t hdr[3] = { cfg.hidden_size, cfg.code_pred_vocab_size, 15 };
+                fwrite(hdr, sizeof(int32_t), 3, fp);
+                fwrite(hidden, sizeof(float), cfg.hidden_size, fp);
+                fwrite(&codebook_0_token, sizeof(int32_t), 1, fp);
+                fwrite(dump_logits.data(), sizeof(float), dump_logits.size(), fp);
+                fwrite(output.data(), sizeof(int32_t), 15, fp);
+                fclose(fp);
+                fprintf(stderr, "  dumped code predictor reference frame to %s\n", dump_path);
+            }
+            dumped = true;
+        }
         return true;
     }
 

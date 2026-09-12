@@ -372,6 +372,17 @@ private:
                                              float temperature,
                                              int32_t top_k);
 
+#ifdef QWEN3_TTS_HIP
+    // Fused cooperative HIP code predictor (docs/code_predictor_plan.md
+    // Phase 2). Same seam as CoreML: host hidden + cb0 in, 15 codes out,
+    // sampling on device. Gated by QWEN3_TTS_USE_HIP_CODE_PRED=1.
+    bool init_hip_code_pred();
+    bool predict_codes_autoregressive_hip(const float * hidden, int32_t codebook_0_token,
+                                         std::vector<int32_t> & output,
+                                         float temperature,
+                                         int32_t top_k);
+#endif
+
     bool build_prefill_graph(const int32_t * text_tokens, int32_t n_tokens,
                              const float * speaker_embd, int32_t language_id,
                              std::vector<float> & prefill_embd,
@@ -449,6 +460,12 @@ private:
     bool use_coreml_code_predictor_ = false;
     std::string coreml_code_predictor_path_;
     bool skip_ggml_code_pred_layers_ = false;
+
+#ifdef QWEN3_TTS_HIP
+    class HipCodePredictor * hip_code_pred_ = nullptr;
+    bool hip_code_pred_ready_ = false;
+    bool hip_code_pred_failed_ = false;
+#endif
 
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing_ = nullptr;

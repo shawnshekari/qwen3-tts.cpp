@@ -273,6 +273,117 @@ follow-on.
 This needs HIP specifically: Vulkan compute has no grid-wide sync, so a
 GLSL version would still be ~10 dispatches per step.
 
+#### Step 1 result (2026-09-12): fused kernel runs, correct, and cannot hang the box
+
+Implemented in `src/hip/code_pred_hip.{h,hip}` (CMake-gated on
+`GGML_HIP`), tested by `tests/test_hip_code_pred` against a reference
+frame dumped from the ggml engine
+(`QWEN3_TTS_DUMP_CODE_PRED=<path> ./qwen3-tts-cli ...` writes the first
+frame's hidden state, cb0 token, all 15 heads' logits and sampled codes).
+
+**The hang was residency contention, not a sync bug.** The barrier
+structure is uniform (every block hits every `grid.sync()` the same
+number of times), but `hipOccupancyMaxActiveBlocksPerMultiprocessor`
+only accounts for the *calling* process. With the compositor and
+llama-server resident, the cooperative grid cannot fully launch; the
+scheduled blocks spin in `grid.sync()` waiting for blocks that never get
+a CU, with the display blocked behind them.
+
+Safeguards now in the kernel:
+
+- **Deadline-aware grid barrier** replaces `cg::grid.sync()`:
+  sense-reversing with a 50M-spin cap (~0.5 s,
+  `QWEN3_TTS_HIP_BARRIER_SPINS`); on timeout a flag is set, every later
+  barrier short-circuits, the grid unwinds, and the host reports
+  "grid barrier timed out" instead of the workstation dying.
+- `prop.cooperativeLaunch` checked at init; grid capped by
+  `QWEN3_TTS_HIP_BLOCKS_PER_CU` (default 4).
+
+Measured (GPU otherwise idle, greedy reference frame, 0.6B F16):
+
+| driver | frame | notes |
+|---|---|---|
+| per-phase launches (16 pos x 8 phases) | 12.8 ms | correctness harness |
+| **fused, 1 block/CU (48 blocks)** | **5.1 ms best / 5.5 mean** | sweet spot |
+| fused, 2/CU (96 blocks) | 5.35 ms | barrier overhead cancels the gain |
+| fused, 4/CU (192 blocks) | 5.5 ms | idem |
+
+15/15 argmax agreement with the ggml reference on both paths, worst
+relative logit error 5.2% (F16 numerics). Ran the fused kernel at 4/CU
+*concurrently with a Vulkan generation* — completed clean, no abort: the
+scenario that previously hung the workstation now survives, and if it
+ever stalls >0.5 s per barrier it aborts instead.
+
+Against the live numbers: the ggml code predictor is 10.1 ms/frame, so
+the fused kernel is ~2x on this stage; integrated, the frame projects to
+**~10 ms (RTF ~0.16)** with the ROCm vocoder at 1.2 ms/frame.
+
+**Gap before integration:** the kernel currently takes all 15 codes as
+input (the test feeds the reference codes). Real generation needs the
+code sampled at position p to feed position p+1's embedding — so the
+on-GPU sampling (greedy argmax first, then temperature/top-k with a
+seeded RNG) from the plan is a prerequisite for wiring this into
+`predict_codes_autoregressive` via the CoreML seam. Also: the 123 KB
+logits readback in `run()` goes to pageable host memory and is likely
+inflating the 5.1 ms — pin it.
+
+#### Step 2 result (2026-09-12): on-device sampling + pipeline integration
+
+Sampling is now in the kernel (`PH_SAMPLE`): greedy block-argmax, or
+temperature + top-k (iterative max-removal) + softmax + PCG32 multinomial
+seeded per `(frame_seed, pos)`. Greedy reproduces the reference codes
+15/15; sampled codes are valid and fused == per-phase 15/15. Sampled
+frame costs ~7.3 ms vs 5.2 greedy — the 50-pass top-k is the delta and
+wants a better selection (bitonic or warp-tournament) as a follow-up.
+
+Integrated via the CoreML seam: `QWEN3_TTS_USE_HIP_CODE_PRED=1` routes
+`predict_codes_autoregressive` through `HipCodePredictor` (weights
+copied to device once at init from the loaded ggml tensors; 0.6B shape
+gated, falls back to the ggml path with a warning otherwise). E2E on the
+XTX (0.6B F16, all-HIP process incl. the fixed vocoder):
+
+| path | generate | total | audio | RTF |
+|---|---|---|---|---|
+| ggml code predictor (greedy) | 1965 ms | 2093 ms | 8.94 s | 0.234 |
+| **fused (greedy)** | **1499 ms** | **1626 ms** | 8.78 s | **0.185** |
+| **fused (temp 0.9, top-k 50)** | 2834 ms | 3081 ms | 15.98 s | **0.193** |
+
+Greedy HIP vs greedy ggml WAVs are *not* bit-identical — expected: the
+talker now runs on the HIP backend too, so hidden states differ from the
+Vulkan-dumped reference and greedy codes diverge at some frame. Both
+outputs are valid speech of matching duration. The unit-level 15/15
+greedy agreement against the dumped frame remains the parity anchor.
+
+**Top-k optimization (2026-09-12):** replaced the 50-pass iterative
+top-k with an in-place bitonic sort of the vocab in `xs` (no extra static
+shared — a separate sort buffer dropped co-resident blocks/CU and made the
+fused matvec phases slower). Sampled fused frame **7.3 -> 5.9 ms**
+(unit, 1/CU); fused == per-phase agreement still 15/15. The logits
+readback was also made optional (pipeline passes nullptr) but measured
+neutral.
+
+**Measurement caveat — e2e RTF is not a clean stage comparison.** The
+code predictor's output changes the sampled codes, which changes clip
+length, which changes RTF (fixed prefill/load amortize over more or
+fewer frames). Random-seed e2e runs spread 0.23-0.25; the early
+0.193 was a long-clip outlier and does not reproduce. The trustworthy
+signal is the per-frame kernel time:
+
+| code predictor | per-frame |
+|---|---|
+| ggml (Phase 1) | ~10.1 ms |
+| fused, iterative top-k | ~7.3 ms |
+| **fused, bitonic top-k** | **~5.9 ms** |
+
+Remaining: the one seed re-audition before any prod move; the talker
+fusion is the next big lever (4.1 ms vs ~1.3 ms floor).
+
+**Seed re-audition (2026-09-12): done.** Four ICL-clone candidates
+through the fused sampled path across two reference voices (the repo
+sample and the user's `nyx_reference.wav`); **seed 3** is the keeper on
+both (seed 4 also stood out). The nyx voice audited cleaner with less
+seed-to-seed variance. Pin seed 3 for the fused path's reference voice.
+
 ## Constraints
 
 - The engine stays on this PC and keeps serving the `:8080` OpenAI-style
