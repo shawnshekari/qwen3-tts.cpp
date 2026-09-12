@@ -384,6 +384,68 @@ sample and the user's `nyx_reference.wav`); **seed 3** is the keeper on
 both (seed 4 also stood out). The nyx voice audited cleaner with less
 seed-to-seed variance. Pin seed 3 for the fused path's reference voice.
 
+### Phase 3 — talker fusion (2026-09-12)
+
+The talker is the same phase machinery as the code predictor with three
+differences: 28 layers instead of 5, a growing KV cache instead of a
+16-position one, and a single `codec_head` (vocab 3072) whose cb0 is
+sampled with the `generate()` rules (suppress `[vocab-1024, vocab)`
+except EOS, HuggingFace repetition penalty over previously emitted cb0,
+then greedy / temperature+top-k). Implemented in
+`src/hip/talker_hip.{h,hip}` (CMake-gated on `GGML_HIP`), tested by
+`tests/test_hip_talker` against a reference step dumped with
+`QWEN3_TTS_DUMP_TALKER=<path> ./qwen3-tts-cli ...` (step embedding,
+hidden, logits, and the full F16 KV cache up to the step position).
+
+Key design points:
+
+- **External KV cache.** The fused kernel reads and writes the *same*
+  F16 `k_cache`/`v_cache` the ggml prefill filled, via the tensors'
+  device pointers (`tensor->data`); position stride `head_dim*n_kv_head`
+  matches the contiguous `[head_dim, n_kv_head, n_ctx]` layout. The
+  prefill stays on the ggml backend; only the decode steps are fused.
+- **Weights read in place.** The talker weights are already resident on
+  the compute backend, so `init_hip_talker` passes the ggml tensors'
+  device pointers straight to the kernel instead of copying. The first
+  integration copied 1.2 GB to a private allocation and that one-time
+  ~209 ms upload ate the whole per-frame win on a 190-frame request;
+  reading in place drops the unaccounted overhead to ~22 ms.
+- **On-device cb0 sampling** mirrors `generate()` exactly. The
+  repetition-penalty set is a device-side byte array the kernel updates
+  as it samples (EOS not marked); frame 0's cb0 still comes from the
+  prefill logits on the host and seeds the set via `mark_seen`.
+- Integrated behind `QWEN3_TTS_USE_HIP_TALKER=1`: the `generate()` loop's
+  `forward_step` + host sampling block is replaced by one fused
+  `HipTalker::run` that returns the next frame's cb0 in `pending_cb0`.
+  Falls back to the ggml path on init failure.
+
+Measured (RX 7900 XTX, 0.6B F16, greedy, GPU otherwise idle):
+
+| path | talker per-frame | notes |
+|---|---|---|
+| ggml `forward_step` | 3.9 ms | compute 3.6 + build/alloc/IO |
+| **fused talker** | **2.4 ms** | in-context (incl. H2D step_embd + D2H hidden + cb0) |
+| fused, unit (n_past=10) | 1.95 ms best / 1.96 mean | 4 blocks/CU sweet spot |
+
+Parity vs the dumped reference: hidden max rel err 0.018%, logits max rel
+err 0.05%, cb0 argmax matches; per-phase and fused agree. Greedy E2E
+produces audio identical in length and RMS to the ggml path.
+
+End-to-end on a ~190-frame request (long text, greedy), fused talker +
+fused code predictor vs ggml talker + fused code predictor:
+**1962 ms vs 2428 ms total generate (~19% faster)**, 10.5 vs 12.7
+ms/frame. The per-frame host tail (code-predictor→talker: embed lookups
++ frame assembly) is 0.47–0.59 ms and is *not* the bottleneck; the
+earlier apparent regression was entirely the one-time weight upload, now
+gone.
+
+Remaining levers: the talker is at 2.4 ms against a ~1.3 ms bandwidth
+floor — the gap is the ~170 grid barriers/step and the attention phase
+using only 16 of the grid's blocks. Device-resident chaining (feed the
+fused code predictor's hidden from the talker's device buffer to skip the
+4 KB round-trip, and ultimately one fused talker+cp kernel with a single
+sync per frame) is the next step.
+
 ## Constraints
 
 - The engine stays on this PC and keeps serving the `:8080` OpenAI-style

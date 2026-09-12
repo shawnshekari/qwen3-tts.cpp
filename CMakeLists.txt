@@ -274,6 +274,17 @@ if(GGML_HIP)
 
     add_executable(test_hip_code_pred tests/test_hip_code_pred.cpp)
     target_link_libraries(test_hip_code_pred PRIVATE code_pred_hip ggml hip::host)
+
+    # Fused HIP talker (docs/code_predictor_plan.md: talker fusion)
+    add_library(talker_hip STATIC src/hip/talker_hip.hip)
+    set_source_files_properties(src/hip/talker_hip.hip PROPERTIES LANGUAGE HIP)
+    target_include_directories(talker_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(talker_hip PUBLIC hip::host)
+
+    target_link_libraries(tts_transformer PUBLIC talker_hip)
+
+    add_executable(test_hip_talker tests/test_hip_talker.cpp)
+    target_link_libraries(test_hip_talker PRIVATE talker_hip ggml hip::host)
 endif()
 
 # Streaming-vs-oneshot parity test for the audio decoder

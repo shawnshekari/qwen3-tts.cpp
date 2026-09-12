@@ -465,6 +465,15 @@ private:
     class HipCodePredictor * hip_code_pred_ = nullptr;
     bool hip_code_pred_ready_ = false;
     bool hip_code_pred_failed_ = false;
+
+    // Fused cooperative HIP talker (docs/code_predictor_plan.md: talker
+    // fusion). Replaces forward_step + the host cb0 sampling block with
+    // one cooperative kernel that also samples cb0 on device. Gated by
+    // QWEN3_TTS_USE_HIP_TALKER=1.
+    bool init_hip_talker();
+    class HipTalker * hip_talker_ = nullptr;
+    bool hip_talker_ready_ = false;
+    bool hip_talker_failed_ = false;
 #endif
 
 #ifdef QWEN3_TTS_TIMING

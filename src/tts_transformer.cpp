@@ -4,6 +4,7 @@
 
 #ifdef QWEN3_TTS_HIP
 #include "hip/code_pred_hip.h"
+#include "hip/talker_hip.h"
 #include <hip/hip_runtime.h>
 #endif
 
@@ -2490,7 +2491,41 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     
     output.resize(model_.config.codec_vocab_size);
     ggml_backend_tensor_get(logits, output.data(), 0, output.size() * sizeof(float));
-    
+
+    // QWEN3_TTS_DUMP_TALKER=<path>: write one decode step's inputs, the
+    // full KV cache up to and including this position, and the reference
+    // hidden/logits for tests/test_hip_talker. First step only.
+    static const char * dump_path = std::getenv("QWEN3_TTS_DUMP_TALKER");
+    static bool dumped = false;
+    if (dump_path && !dumped) {
+        const auto & cfg = model_.config;
+        const int kv_stride = cfg.head_dim * cfg.n_key_value_heads;
+        FILE * fp = fopen(dump_path, "wb");
+        if (fp) {
+            const int32_t hdr[7] = { cfg.hidden_size, cfg.codec_vocab_size, cfg.n_layers,
+                                     cfg.n_attention_heads, cfg.n_key_value_heads,
+                                     cfg.head_dim, n_past };
+            fwrite(hdr, sizeof(int32_t), 7, fp);
+            fwrite(step_embd, sizeof(float), cfg.hidden_size, fp);
+            fwrite(last_hidden_.data(), sizeof(float), cfg.hidden_size, fp);
+            fwrite(output.data(), sizeof(float), cfg.codec_vocab_size, fp);
+            const size_t row_bytes = (size_t) kv_stride * sizeof(ggml_fp16_t);
+            const size_t layer_bytes = (size_t) state_.cache.n_ctx * row_bytes;
+            std::vector<uint8_t> buf(layer_bytes);
+            for (int il = 0; il < cfg.n_layers; ++il) {
+                ggml_backend_tensor_get(state_.cache.k_cache[il], buf.data(), 0, layer_bytes);
+                fwrite(buf.data(), 1, (size_t) (n_past + 1) * row_bytes, fp);
+            }
+            for (int il = 0; il < cfg.n_layers; ++il) {
+                ggml_backend_tensor_get(state_.cache.v_cache[il], buf.data(), 0, layer_bytes);
+                fwrite(buf.data(), 1, (size_t) (n_past + 1) * row_bytes, fp);
+            }
+            fclose(fp);
+            fprintf(stderr, "  dumped talker reference step to %s (n_past=%d)\n", dump_path, n_past);
+        }
+        dumped = true;
+    }
+
     state_.cache.n_used = n_past + 1;
     
     ggml_backend_sched_reset(state_.sched);
@@ -2794,6 +2829,72 @@ bool TTSTransformer::predict_codes_autoregressive_hip(const float * hidden, int3
         return false;
     }
     output.assign(codes.begin(), codes.end());
+    return true;
+}
+
+bool TTSTransformer::init_hip_talker() {
+    hip_talker_failed_ = true;
+    const auto & cfg = model_.config;
+    if (cfg.n_layers > TL_MAX_LAYERS) {
+        error_msg_ = "HIP fused talker supports at most " + std::to_string(TL_MAX_LAYERS) + " layers";
+        return false;
+    }
+
+    tl_params P;
+    P.hidden    = cfg.hidden_size;
+    P.n_head    = cfg.n_attention_heads;
+    P.n_kv_head = cfg.n_key_value_heads;
+    P.head_dim  = cfg.head_dim;
+    P.ff        = cfg.intermediate_size;
+    P.vocab     = cfg.codec_vocab_size;
+    P.n_layer   = (int) model_.layers.size();
+    P.eps       = cfg.rms_norm_eps;
+    P.rope_theta = cfg.rope_theta;
+
+    // The talker weights are already resident on the compute backend (the
+    // model was loaded there), so the fused kernel reads them through the
+    // ggml tensors' device pointers directly — no 1.2 GB re-upload. The
+    // norms are F32 (read as raw bits by the kernel) and the matrices F16,
+    // matching tl_weights' layout.
+    auto dev_ptr = [&](ggml_tensor * t, ggml_type want, const uint16_t ** out) -> bool {
+        if (!t || t->type != want) {
+            error_msg_ = std::string("HIP talker: unexpected tensor for ") + (t ? ggml_get_name(t) : "(null)");
+            return false;
+        }
+        *out = (const uint16_t *) t->data;
+        return true;
+    };
+
+    tl_weights W = {};
+    for (int il = 0; il < P.n_layer; ++il) {
+        const transformer_layer & L = model_.layers[il];
+        if (!dev_ptr(L.attn_norm,    GGML_TYPE_F32, &W.attn_norm[il])) return false;
+        if (!dev_ptr(L.attn_q_norm,  GGML_TYPE_F32, &W.q_norm[il]))    return false;
+        if (!dev_ptr(L.attn_k_norm,  GGML_TYPE_F32, &W.k_norm[il]))    return false;
+        if (!dev_ptr(L.ffn_norm,     GGML_TYPE_F32, &W.ffn_norm[il]))  return false;
+        if (!dev_ptr(L.attn_q,       GGML_TYPE_F16, &W.wq[il]))        return false;
+        if (!dev_ptr(L.attn_k,       GGML_TYPE_F16, &W.wk[il]))        return false;
+        if (!dev_ptr(L.attn_v,       GGML_TYPE_F16, &W.wv[il]))        return false;
+        if (!dev_ptr(L.attn_output,  GGML_TYPE_F16, &W.wo[il]))        return false;
+        if (!dev_ptr(L.ffn_gate,     GGML_TYPE_F16, &W.w_gate[il]))    return false;
+        if (!dev_ptr(L.ffn_up,       GGML_TYPE_F16, &W.w_up[il]))      return false;
+        if (!dev_ptr(L.ffn_down,     GGML_TYPE_F16, &W.w_down[il]))    return false;
+    }
+    if (!dev_ptr(model_.output_norm, GGML_TYPE_F32, &W.output_norm)) return false;
+    if (!dev_ptr(model_.codec_head,  GGML_TYPE_F16, &W.codec_head))  return false;
+
+    hip_talker_ = new HipTalker();
+    std::string err;
+    if (!hip_talker_->init(P, W, &err)) {
+        error_msg_ = "HIP talker init: " + err;
+        delete hip_talker_;
+        hip_talker_ = nullptr;
+        return false;
+    }
+    hip_talker_failed_ = false;
+    hip_talker_ready_ = true;
+    fprintf(stderr, "  HIP fused talker: %d blocks, %d layers, vocab %d\n",
+            hip_talker_->grid_blocks(), P.n_layer, P.vocab);
     return true;
 }
 #endif // QWEN3_TTS_HIP
@@ -3336,10 +3437,81 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<float> step_embd(cfg.hidden_size, 0.0f);
     std::vector<float> embd_row(cfg.hidden_size);
 
+    // Host cb0 sampling: suppression + HuggingFace repetition penalty +
+    // temperature/top-k multinomial (greedy if temperature <= 0). Used for
+    // frame 0 (from the prefill logits) and by the non-fused decode path.
+    auto sample_cb0 = [&](float * lg) -> int32_t {
+        for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
+            if (i != cfg.codec_eos_id) lg[i] = -INFINITY;
+        }
+        if (repetition_penalty != 1.0f) {
+            for (int32_t tok : generated_cb0_tokens) {
+                if (tok >= 0 && tok < cfg.codec_vocab_size) {
+                    if (lg[tok] > 0.0f) lg[tok] /= repetition_penalty;
+                    else lg[tok] *= repetition_penalty;
+                }
+            }
+        }
+        if (temperature <= 0.0f) {
+            return argmax(lg, cfg.codec_vocab_size);
+        }
+        for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) lg[i] /= temperature;
+        if (top_k > 0 && top_k < cfg.codec_vocab_size) {
+            std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
+            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) scored[i] = {lg[i], i};
+            std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
+                [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+                    return a.first > b.first;
+                });
+            float threshold = scored[top_k - 1].first;
+            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                if (lg[i] < threshold) lg[i] = -INFINITY;
+            }
+        }
+        float max_logit = *std::max_element(lg, lg + cfg.codec_vocab_size);
+        double sum = 0.0;
+        for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) { probs[i] = expf(lg[i] - max_logit); sum += probs[i]; }
+        for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) probs[i] = (float)(probs[i] / sum);
+        std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
+        return dist(rng_);
+    };
+
+#ifdef QWEN3_TTS_HIP
+    // Fused talker: one cooperative kernel per frame replaces forward_step
+    // and samples cb0 on device (suppression + repetition penalty tracked
+    // in a device-side seen set + temp/top-k). Frame 0's cb0 still comes
+    // from the prefill logits on the host, then seeds the seen set.
+    static const bool use_hip_talker =
+        std::getenv("QWEN3_TTS_USE_HIP_TALKER") != nullptr;
+    bool fused_talker = false;
+    int32_t pending_cb0 = -1;
+    if (use_hip_talker && !hip_talker_failed_) {
+        if (!hip_talker_ready_ && !init_hip_talker()) {
+            fprintf(stderr, "  HIP fused talker unavailable, using GGML: %s\n", error_msg_.c_str());
+        } else {
+            fused_talker = true;
+            hip_talker_->reset_repetition();
+            last_hidden_.resize(cfg.hidden_size);
+            pending_cb0 = sample_cb0(logits.data());
+            std::string serr;
+            if (!hip_talker_->mark_seen(pending_cb0, &serr)) {
+                fprintf(stderr, "  HIP fused talker mark_seen failed: %s\n", serr.c_str());
+            }
+        }
+    }
+#endif
+
     int64_t t_decode_start = verbose_ ? verbose_now_ms() : 0;
     int64_t t_decode_last = t_decode_start;
 
+#ifdef QWEN3_TTS_TIMING
+    double t_loop_total_ms = 0, t_host_tail_ms = 0;
+#endif
+
     for (int frame = 0; frame < max_len; ++frame) {
+#ifdef QWEN3_TTS_TIMING
+        auto t_loop_start = clk::now();
+#endif
         if (verbose_ && frame > 0 && frame % 25 == 0) {
             int64_t now = verbose_now_ms();
             fprintf(stderr, "  decode: frame %d/%d (last 25 frames in %lld ms, total %lld ms)\n",
@@ -3365,65 +3537,16 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             for (int i = 0; i < 5; ++i) fprintf(stderr, " %d(%.3f)", sc[i].second, sc[i].first);
             fprintf(stderr, "\n");
         }
-        // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
-        for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
-            if (i != cfg.codec_eos_id) {
-                logits[i] = -INFINITY;
-            }
-        }
-
-        // Repetition penalty (HuggingFace style) on previously generated CB0 tokens
-        if (repetition_penalty != 1.0f) {
-            for (int32_t tok : generated_cb0_tokens) {
-                if (tok >= 0 && tok < cfg.codec_vocab_size) {
-                    if (logits[tok] > 0.0f) {
-                        logits[tok] /= repetition_penalty;
-                    } else {
-                        logits[tok] *= repetition_penalty;
-                    }
-                }
-            }
-        }
-
         int32_t next_token;
-        if (temperature <= 0.0f) {
-            next_token = argmax(logits.data(), cfg.codec_vocab_size);
-        } else {
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                logits[i] /= temperature;
-            }
-
-            if (top_k > 0 && top_k < cfg.codec_vocab_size) {
-                std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
-                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                    scored[i] = {logits[i], i};
-                }
-                std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                    [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                        return a.first > b.first;
-                    });
-                float threshold = scored[top_k - 1].first;
-                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                    if (logits[i] < threshold) {
-                        logits[i] = -INFINITY;
-                    }
-                }
-            }
-
-            float max_logit = *std::max_element(logits.data(), logits.data() + cfg.codec_vocab_size);
-            double sum = 0.0;
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                probs[i] = expf(logits[i] - max_logit);
-                sum += probs[i];
-            }
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                probs[i] = (float)(probs[i] / sum);
-            }
-
-            std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
-            next_token = dist(rng_);
+#ifdef QWEN3_TTS_HIP
+        if (fused_talker) {
+            next_token = pending_cb0;   // sampled on device last iteration
+        } else
+#endif
+        {
+            next_token = sample_cb0(logits.data());
         }
-        
+
         if (next_token == cfg.codec_eos_id) {
             break;
         }
@@ -3441,8 +3564,9 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         timing.t_code_pred_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        auto t_after_cp = t1;
 #endif
-        
+
         for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
             frame_codes[cb] = codes_1_15[cb - 1];
         }
@@ -3501,6 +3625,29 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
+        t_host_tail_ms += std::chrono::duration<double, std::milli>(t0 - t_after_cp).count();
+#endif
+#ifdef QWEN3_TTS_HIP
+        if (fused_talker) {
+            // The fused kernel reads/writes the same F16 KV cache the ggml
+            // prefill filled; position stride = head_dim*n_kv_head matches
+            // the cache tensor's contiguous [head_dim, n_kv_head, n_ctx].
+            tl_kv kv = {};
+            for (int il = 0; il < cfg.n_layers; ++il) {
+                kv.k[il] = (const uint16_t *) state_.cache.k_cache[il]->data;
+                kv.v[il] = (const uint16_t *) state_.cache.v_cache[il]->data;
+            }
+            std::uniform_int_distribution<uint64_t> tdist(1, ~0ull);
+            const uint64_t tseed = tdist(rng_);
+            std::string terr;
+            if (!hip_talker_->run(step_embd.data(), n_past, kv, temperature, top_k,
+                                 repetition_penalty, cfg.codec_eos_id, tseed,
+                                 &pending_cb0, last_hidden_.data(), nullptr,
+                                 /*fused=*/true, &terr)) {
+                error_msg_ = "HIP fused talker: " + terr;
+                return false;
+            }
+        } else
 #endif
         if (!forward_step(step_embd.data(), n_past, logits)) {
             return false;
@@ -3509,8 +3656,11 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         t1 = clk::now();
         timing.t_talker_forward_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-        
+
         n_past++;
+#ifdef QWEN3_TTS_TIMING
+        t_loop_total_ms += std::chrono::duration<double, std::milli>(clk::now() - t_loop_start).count();
+#endif
     }
 
     last_decode_ms_ = verbose_now_ms() - t_prefill_end_ms;
@@ -3551,6 +3701,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     fprintf(stderr, "\n  Embed lookups:      %8.1f ms   (%.1f ms/frame)\n", t.t_embed_lookup_ms, nf > 0 ? t.t_embed_lookup_ms / nf : 0.0);
     double accounted = t.t_prefill_build_ms + t.t_prefill_forward_ms + t.t_talker_forward_ms + t.t_code_pred_ms + t.t_embed_lookup_ms;
     fprintf(stderr, "  Other/overhead:     %8.1f ms\n", t.t_generate_total_ms - accounted);
+    fprintf(stderr, "    [loop wall: %.1f ms; host tail (cp->talker): %.1f ms = %.2f ms/frame]\n",
+            t_loop_total_ms, t_host_tail_ms, nf > 0 ? t_host_tail_ms / nf : 0.0);
     fprintf(stderr, "  ─────────────────────────────────────────\n");
     fprintf(stderr, "  Total generate:     %8.1f ms\n", t.t_generate_total_ms);
     if (nf > 0) {
