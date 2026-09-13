@@ -1,8 +1,8 @@
 # Performance Optimization Plan
 
 ## Goals
-- Target: RTF < 0.5x (2x faster than real-time) for 0.6B model
-- Hardware: RX 7900 XTX (Vulkan), 16-core CPU, 24 GB RAM
+- Target: RTF < 0.5x (2x faster than real-time) for 0.6B model — **met 2026-09-10; now 0.12x** (see Results Log and Phase 4)
+- Hardware: RX 7900 XTX (HIP/ROCm since Sep 10; Vulkan before), 16-core CPU, 24 GB RAM
 - Use case: SillyTavern / Open-LLM-VTuber (low latency, conversational)
 
 ## Current Baseline (Jun 19, 2026)
@@ -107,6 +107,85 @@
 | Jun 19 | 0.6B F16 | 1.98s | 1637ms | 0.83x | Baseline (amy_voice) |
 | Jun 19 | 1.7B Q8_0 | 3.42s | 10362ms | 3.03x | Baseline (nyx_voice) |
 | Jun 19 | 1.7B Q8_0 | 1.98s | 5967ms | 3.02x | Baseline (amy_voice) |
+
+| Sep 10 | 0.6B F16 | 8.4s | 15.5s | 1.85x | Vulkan; engine pushed into GTT by llama-server VRAM |
+| Sep 10 | 0.6B F16 | 8.4s | 2.25s | 0.27x | VRAM ordering + vocoder dGPU placement fixes |
+| Sep 10 | 0.6B F16 | 8.4s | 1.7s | 0.21x | HIP build, persistent code-predictor graphs |
+| Sep 12 | 0.6B F16 | — | 9 ms/frame | 0.14x | fused cooperative talker + cp, on-device sampling/chaining |
+| Sep 12 | 0.6B F16 | — | 8.5 ms/frame | **0.12x** | 1 cooperative block per CU; queue median over live traffic (p90 0.19) |
+
+## Phase 4: Next steps — ALL TO BE DISCUSSED (proposed 2026-09-12, nothing started)
+
+Status: **proposals only.** None of these is agreed, scheduled or in progress.
+Decide each one before writing code; the correctness invariants in
+`talker_fusion_handoff.md` (Gate 1 `seen[]` re-sync, seed pin coupling) apply
+to anything that touches the fused/ggml boundary.
+
+Context: at 8.5 ms/frame the generation loop is ~12x real time. What the queue
+measures (RTF 0.12) is now dominated by per-request overhead rather than the
+loop, which changes what is worth doing. For a typical 4 s chunk: loop ~425 ms
+(~75%), vocoder ~60 ms (~10%), prefill ~12 ms, HTTP + WAV + queue ~50-80 ms
+(~10%), fused-kernel lazy init ~1 s on the first request after a restart only.
+
+### Task 4.1: Enable frame fusion at 1 block/CU — TO BE DISCUSSED
+- [ ] `QWEN3_TTS_USE_HIP_FRAME_FUSION=1` merges talker + cp into one launch per
+  frame and removes the host tail. Built and parity-tested; left off because it
+  shares the cooperative residency requirement — an objection 1/CU has removed.
+- [ ] Gate: CLI run `cmp`-identical to current output at seed 2; one listen;
+  a day of journal with zero `timed out` lines.
+- Expected: ~8.5 -> ~7.5 ms/frame (~10% of the loop).
+
+### Task 4.2: Warm-up request at service start — TO BE DISCUSSED
+- [ ] After `tts-register-voices` registers, send one short synthesis per voice
+  so the fused kernels, persistent cp graphs and vocoder buffers initialise
+  before the first real utterance (today's first request measures RTF ~0.41).
+- Expected: removes the one remaining visibly slow moment after a restart.
+
+### Task 4.3: Lower the normal barrier spin cap from data — TO BE DISCUSSED
+- [ ] Instrument: `atomicMax` of observed spins per launch, log p99 for a day.
+- [ ] Then set the cap (currently 50M spins ~= 0.5 s) to ~10x the p99 — likely
+  ~50 ms. Legit stragglers are <1 ms; a rare timeout would then cost ~50 ms
+  instead of 0.5 s per component.
+
+### Task 4.4: Streaming for long chunks (queue-side) — TO BE DISCUSSED
+- [ ] The server supports `stream_format` + `stream_batch_size`; the queue
+  renders whole chunks before playing. Per-sentence chunks are fine; the Claude
+  Code hook's long paragraphs (8-10 s of audio) would start in ~0.3 s with
+  batch 8. Requires the queue to play from a pipe rather than a file.
+- Latency win only; throughput unchanged.
+
+### Task 4.5: Keep-alive connection from the queue — TO BE DISCUSSED
+- [ ] `urllib` opens a new TCP connection per chunk; reuse an `http.client`
+  connection. ~1 ms/chunk. Trivial, low value; listed for completeness.
+
+### Task 4.6: Seed audition on the ggml path — TO BE DISCUSSED
+- [ ] Seed 2 was picked by ear on the fused arithmetic. If a seed sounds right
+  on both paths, a fallback becomes inaudible rather than a voice change.
+  4-5 seeds, HIP env vars unset, same texts, one CLI session.
+- Robustness, not speed; low priority now that timeouts are rare.
+
+### Task 4.7: Re-evaluate the ggml bump — TO BE DISCUSSED
+- [ ] Sep 10 rejected v0.23.0 because it changed talker numerics (voice
+  re-roll). Talker and cp are now HIP kernels, so a bump only touches vocoder
+  (232 -> 141 ms per 8 s) and prefill — but prefill still feeds frame 0, so the
+  roll can still shift. Try `ggml-bump`, `cmp` the WAV; not bit-identical means
+  a re-audition for ~1.5% end to end. Probably not worth it.
+
+### Task 4.8: Upstream the general fixes — TO BE DISCUSSED
+- [ ] `e2597f1` ggml `conv_transpose_1d` O(K) -> PR to ggml.
+- [ ] `b11fd22` / `cebfbd3` dGPU vocoder placement, `5dcca64` per-request
+  `max_audio_tokens` -> PR to khimaros.
+- Not perf; hygiene. All model-agnostic.
+
+### Explicitly not proposed
+- cp kernel micro-work: 5.1 ms for 15 sequential steps x 5 layers is near the
+  launch-latency floor for a cooperative grid on RDNA3 (see the grid.sync
+  microbench in `code_predictor_plan.md`).
+- CPU offload of anything (measured slower, Sep 10).
+- Vocoder beyond 4.7 (1.2 ms/frame is ~1.5% of real time).
+
+If only one thing is agreed: 4.1 then 4.2 — about an hour, no new kernels,
+median toward ~0.10 and the slow first utterance gone.
 
 ## Optimization Priority (based on timing data)
 

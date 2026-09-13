@@ -213,6 +213,11 @@ QWEN3_TTS_USE_HIP_TALKER=1 QWEN3_TTS_USE_HIP_CODE_PRED=1 QWEN3_TTS_HIP_CP_FAIL_A
 curl :8080/v1/audio/speech -d '{"input":"...","voice":"voice_1","max_audio_tokens":150}'
 ```
 
+**Proposed next steps (all TO BE DISCUSSED, none started):** see
+`performance_plan.md` Phase 4 — frame fusion at 1/CU, warm-up request,
+data-driven spin cap, queue-side streaming, ggml-path seed audition, ggml
+bump re-evaluation, upstream PRs.
+
 ## KNOWN ISSUE — permanent latch under contention degrades RTF (self-healing deferred)
 
 **Symptom (observed 2026-09-12):** client RTF climbed from the ~0.13
