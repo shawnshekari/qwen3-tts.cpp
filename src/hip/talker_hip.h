@@ -113,6 +113,11 @@ public:
     // predictor without a host round-trip).
     float * device_hidden() { return d_hidden_; }
 
+    // Copy the last run's post-norm hidden (P.hidden floats) to the host.
+    // run()/run_device() skip this copy when chaining into the fused cp;
+    // the ggml cp needs it if it has to take over mid-request.
+    bool fetch_hidden(float * host_out, std::string * err);
+
     // Device-side repetition-penalty seen set (vocab bytes). Shared with
     // the fused-frame kernel so the penalty state survives across the
     // fused/chained boundary; reset per request via reset_repetition().

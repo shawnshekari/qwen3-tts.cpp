@@ -38,6 +38,13 @@ struct tts_timing {
     // Code predictor totals (accumulated across all frames)
     double t_code_pred_ms = 0;            // total predict_codes_autoregressive
     double t_code_pred_init_ms = 0;       // init/clear KV cache + CB0 embed lookup
+    // Sub-buckets of t_code_pred_init_ms (ggml path only), to see which
+    // piece is slow when the cp has to take over from the fused kernel.
+    double t_code_pred_init_kv_ms = 0;    // init_code_pred_kv_cache (rare)
+    double t_code_pred_init_clear_ms = 0; // clear_code_pred_kv_cache memsets
+    double t_code_pred_init_fetch_ms = 0; // fused-talker hidden D2H (fallback only)
+    double t_code_pred_init_embed_ms = 0; // cb0 embedding lookup
+    double t_code_pred_init_graphs_ms = 0;// init_code_pred_graphs (first use)
     double t_code_pred_prefill_ms = 0;    // code pred prefill (2-token, per frame)
     double t_code_pred_steps_ms = 0;      // code pred autoregressive steps (14 steps, per frame)
     double t_code_pred_graph_build_ms = 0;  // graph build (prefill + steps combined)
@@ -197,6 +204,7 @@ struct tts_kv_cache {
     
     int32_t n_ctx = 0;
     int32_t n_used = 0;
+    bool needs_clear = true;   // zero the buffer before first use (see predict_codes_autoregressive)
     int32_t head_dim = 128;
     int32_t n_kv_heads = 8;
     int32_t n_layers = 28;

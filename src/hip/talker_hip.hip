@@ -551,6 +551,12 @@ bool HipTalker::run_impl(const float * step_embd, bool step_is_device, int32_t n
     return true;
 }
 
+bool HipTalker::fetch_hidden(float * host_out, std::string * err) {
+    if (!p_) { if (err) *err = "not initialised"; return false; }
+    CK(hipMemcpy(host_out, p_->B.hidden_out, p_->P.hidden * sizeof(float), hipMemcpyDeviceToHost));
+    return true;
+}
+
 bool HipTalker::mark_seen(int32_t token, std::string * err) {
     if (!p_) { if (err) *err = "not initialised"; return false; }
     if (token < 0 || token >= p_->P.vocab) return true;

@@ -160,6 +160,59 @@ the two `Environment=` fused flags (or restore
 `/tmp/tts-engine.service.bak`) + daemon-reload + restart, and restore
 seed pins to 42.
 
+## RESOLVED 2026-09-12 (evening) — contention timeouts, the runaway, and the 10 s GPU pegs
+
+Three findings from a live investigation, all fixed and measured:
+
+**1. `QWEN3_TTS_HIP_BLOCKS_PER_CU=1` eliminates the barrier timeouts.**
+With llama-server + embedding-server driven to 99% GPU by a load
+generator, the default 4/CU (192-block) grids hit the barrier deadline on
+*every* request — talker AND cp -> GGML, ~220 ms/frame under time-slicing,
+23-28 s per ~110-frame request. At 1/CU (48 blocks): **zero timeouts in
+every run**, fused path intact at 14.7 ms/frame under full load (RTF ~0.18),
+12.8 ms/frame through the live queue. On a quiet GPU 1/CU is also slightly
+faster (9.0 vs 9.5 ms/frame) with bit-identical output. The service unit
+now sets it (TTS-Player `tts-engine.service`). The self-heal latch remains
+as the safety net; it should rarely fire now.
+
+**2. Mid-request fused-cp -> GGML fallback used a stale hidden (runaway root cause).**
+The fused talker leaves its post-norm hidden on the device and skips the
+host copy (chaining); if the fused cp then failed or was latched, the ggml
+cp was handed `last_hidden_` — whatever `forward_step` last wrote, many
+frames earlier. Codes 1-15 were computed for the wrong frame from then on,
+the next step embedding was garbage, the talker drifted and never emitted
+EOS. Reproduced deterministically on a quiet GPU with the new
+`QWEN3_TTS_HIP_CP_FAIL_AT=<n>` debug env: 2048 frames (CLI cap) / 164 s of
+audio without the fix, 107 frames / 8.5 s with it. Fix:
+`HipTalker::fetch_hidden()` D2H before the ggml cp runs whenever it was
+given a device hidden. Every "runaway" observed today was on such a
+request.
+
+**3. The 70-80 ms/frame `Init/KV/embed` after a fallback was contention, not a bug in the bucket.**
+Sub-timers were added (kv init / clear / hidden fetch / embed / graphs) —
+on a quiet GPU all are ~0. Under external load every synchronous device
+op waits out a scheduler timeslice, and the ggml talker was equally slow
+(79 ms/frame). Still, the per-frame `clear_code_pred_kv_cache()` (2 x
+n_layers synchronous memsets) was unnecessary: every slot is written before
+it is read within a frame and `inp_mask` hides the rest, so the cache is now
+zeroed once at allocation (`needs_clear`) and only `n_used` is reset per
+frame. Output bit-identical on the fused->ggml handoff and the pure ggml
+path. With (1) in place the ggml path is rarely exercised anyway.
+
+Also: the timing block's `Backend:` line now reports `HIP fused`,
+`HIP fused -> GGML (fallback mid-request)` or `GGML` truthfully — it used
+to print GGML even when the fused cp ran, which misled the diagnosis.
+
+Useful commands:
+```
+# reproduce a mid-request handoff on a quiet GPU
+QWEN3_TTS_USE_HIP_TALKER=1 QWEN3_TTS_USE_HIP_CODE_PRED=1 QWEN3_TTS_HIP_CP_FAIL_AT=5 \
+  ./build-hip-host/qwen3-tts-cli -m models/qwen3-tts-0.6b-f16.gguf --vocoder models/qwen3-tts-tokenizer-f16.gguf \
+  -r ~/tools/reference_voices/nyx_reference.wav -t "..." --seed 2 -o /tmp/x.wav
+# per-request frame budget from a client (clamped to --max-tokens)
+curl :8080/v1/audio/speech -d '{"input":"...","voice":"voice_1","max_audio_tokens":150}'
+```
+
 ## KNOWN ISSUE — permanent latch under contention degrades RTF (self-healing deferred)
 
 **Symptom (observed 2026-09-12):** client RTF climbed from the ~0.13

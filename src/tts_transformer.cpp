@@ -861,6 +861,7 @@ bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
     state_.code_pred_cache.n_ctx = n_ctx;
     state_.code_pred_cache.n_used = 0;
     state_.code_pred_cache.head_dim = cfg.head_dim;
+    state_.code_pred_cache.needs_clear = true;
     state_.code_pred_cache.n_kv_heads = cfg.n_key_value_heads;
     state_.code_pred_cache.n_layers = cfg.code_pred_layers;
     
@@ -895,6 +896,10 @@ bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
     }
     
     state_.code_pred_cache.buffer = ggml_backend_alloc_ctx_tensors(state_.code_pred_cache.ctx, state_.backend);
+    // Zero once here. Per frame we only reset n_used (see
+    // predict_codes_autoregressive): every slot is written before it is
+    // read and the mask hides the rest, so the only thing the memset ever
+    // protected against was NaN bit patterns in fresh memory.
     if (!state_.code_pred_cache.buffer) {
         error_msg_ = "Failed to allocate code predictor KV cache buffer";
         return false;
@@ -2983,9 +2988,19 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_HIP
     static const bool use_hip_code_pred =
         std::getenv("QWEN3_TTS_USE_HIP_CODE_PRED") != nullptr;
+    // Debug: QWEN3_TTS_HIP_CP_FAIL_AT=<n> makes the n-th fused cp call in
+    // the process fail, to exercise the mid-request fused->ggml handoff on
+    // a quiet GPU (the real trigger is a barrier timeout under contention).
+    static const long cp_fail_at = std::getenv("QWEN3_TTS_HIP_CP_FAIL_AT")
+        ? strtol(std::getenv("QWEN3_TTS_HIP_CP_FAIL_AT"), nullptr, 10) : -1;
+    static long cp_calls = 0;
     if (use_hip_code_pred && !hip_code_pred_failed_) {
         if (!hip_code_pred_ready_ && !init_hip_code_pred()) {
             fprintf(stderr, "  HIP fused code predictor unavailable, using GGML: %s\n", error_msg_.c_str());
+        } else if (cp_calls++ == cp_fail_at) {
+            error_msg_ = "debug: QWEN3_TTS_HIP_CP_FAIL_AT forced failure";
+            fprintf(stderr, "  HIP fused code predictor failed, falling back to GGML: %s\n", error_msg_.c_str());
+            hip_code_pred_failed_ = true;
         } else if (predict_codes_autoregressive_hip(hidden, codebook_0_token, output, temperature, top_k, device_hidden)) {
             return true;
         } else {
@@ -2993,6 +3008,25 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             hip_code_pred_failed_ = true;
         }
     }
+
+    // The fused talker leaves its hidden on the device and skips the host
+    // copy (chaining). If the ggml cp has to take over, the host `hidden`
+    // is whatever forward_step last wrote - stale by many frames - and the
+    // cp would produce codes for the wrong frame from here on (garbage
+    // step embeddings, no EOS, runaway). Fetch the real one first.
+    if (device_hidden && hip_talker_) {
+        std::string ferr;
+        if (!hip_talker_->fetch_hidden(last_hidden_.data(), &ferr)) {
+            error_msg_ = "HIP talker hidden fetch: " + ferr;
+            return false;
+        }
+        hidden = last_hidden_.data();
+    }
+#endif
+#ifdef QWEN3_TTS_TIMING
+    // tp walks the sub-buckets; t0 stays put for the Init/KV/embed total.
+    auto tp = clk::now();
+    if (timing_) timing_->t_code_pred_init_fetch_ms += std::chrono::duration<double, std::milli>(tp - t0).count();
 #endif
 
     if (state_.code_pred_cache.n_ctx < 16) {
@@ -3000,7 +3034,29 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             return false;
         }
     }
-    clear_code_pred_kv_cache();
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_code_pred_init_kv_ms += std::chrono::duration<double, std::milli>(t1 - tp).count();
+    tp = t1;
+#endif
+    // Don't memset the 16-slot cache every frame: that is 2 x n_layers
+    // synchronous device ops, and under cross-process GPU contention each
+    // one waits out a scheduler timeslice (measured ~70 ms/frame in the
+    // live server after a fused-cp fallback, vs 0.2 ms quiet). Every slot
+    // is overwritten before it is read within a frame and inp_mask hides
+    // the rest, so resetting the write cursor is enough once the buffer
+    // has been zeroed at allocation.
+    if (state_.code_pred_cache.needs_clear) {
+        clear_code_pred_kv_cache();
+        state_.code_pred_cache.needs_clear = false;
+    } else {
+        state_.code_pred_cache.n_used = 0;
+    }
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_code_pred_init_clear_ms += std::chrono::duration<double, std::milli>(t1 - tp).count();
+    tp = t1;
+#endif
     
     output.resize(15);
     std::vector<float> logits_data(cfg.code_pred_vocab_size);
@@ -3052,6 +3108,11 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     if (!lookup_single_embedding_row(model_.codec_embd, codebook_0_token, cb0_embd.data())) {
         return false;
     }
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_code_pred_init_embed_ms += std::chrono::duration<double, std::milli>(t1 - tp).count();
+    tp = t1;
+#endif
 
     // Persistent graphs (first frame builds them; falls back to the
     // scheduler path below if the device backend can't run them, or when
@@ -3066,6 +3127,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
+    if (timing_) timing_->t_code_pred_init_graphs_ms += std::chrono::duration<double, std::milli>(t1 - tp).count();
     if (timing_) timing_->t_code_pred_init_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
 
@@ -4012,12 +4074,23 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     fprintf(stderr, "      Compute:        %8.1f ms   (%.1f ms/frame)\n", t.t_talker_compute_ms, nf > 0 ? t.t_talker_compute_ms / nf : 0.0);
     fprintf(stderr, "      Data I/O:       %8.1f ms   (%.1f ms/frame)\n", t.t_talker_data_ms, nf > 0 ? t.t_talker_data_ms / nf : 0.0);
     fprintf(stderr, "\n  Code predictor (total / per-frame):\n");
-    fprintf(stderr, "    Backend:          %s\n", use_coreml_code_predictor_ ? "CoreML (CPU+NE)" : "GGML");
+    // Say what actually ran: the fused HIP cp, the ggml graph, or a mix
+    // (fused until a barrier timeout, ggml for the rest of the request).
+    const char * cp_backend = use_coreml_code_predictor_ ? "CoreML (CPU+NE)" : "GGML";
+#ifdef QWEN3_TTS_HIP
+    if (cp_fused_ran_) cp_backend = hip_code_pred_failed_ ? "HIP fused -> GGML (fallback mid-request)" : "HIP fused";
+#endif
+    fprintf(stderr, "    Backend:          %s\n", cp_backend);
     if (use_coreml_code_predictor_ && !coreml_code_predictor_path_.empty()) {
         fprintf(stderr, "    CoreML model:     %s\n", coreml_code_predictor_path_.c_str());
     }
     fprintf(stderr, "    Total:            %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_ms, nf > 0 ? t.t_code_pred_ms / nf : 0.0);
     fprintf(stderr, "      Init/KV/embed:  %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_init_ms, nf > 0 ? t.t_code_pred_init_ms / nf : 0.0);
+    if (t.t_code_pred_init_ms > 0.0) {
+        fprintf(stderr, "        kv init %.1f / clear %.1f / hidden fetch %.1f / embed %.1f / graphs %.1f ms\n",
+                t.t_code_pred_init_kv_ms, t.t_code_pred_init_clear_ms, t.t_code_pred_init_fetch_ms,
+                t.t_code_pred_init_embed_ms, t.t_code_pred_init_graphs_ms);
+    }
     fprintf(stderr, "      Prefill (2tok): %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_prefill_ms, nf > 0 ? t.t_code_pred_prefill_ms / nf : 0.0);
     fprintf(stderr, "      Steps (14):     %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_steps_ms, nf > 0 ? t.t_code_pred_steps_ms / nf : 0.0);
     fprintf(stderr, "      Graph build:    %8.1f ms   (%.1f ms/frame)\n", t.t_code_pred_graph_build_ms, nf > 0 ? t.t_code_pred_graph_build_ms / nf : 0.0);
